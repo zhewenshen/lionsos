@@ -32,7 +32,6 @@
 #include <sddf/timer/config.h>
 #include <sddf/util/cache.h>
 #include <sddf/util/printf.h>
-#include <sddf/util/string.h>
 #include <sddf/util/util.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -581,7 +580,7 @@ static void setup_http_server(void)
 
     err_t err = tcp_bind(pcb, IP_ADDR_ANY, 80);
     if (err != ERR_OK) {
-        sddf_dprintf("Failed to bind TCP PCB: %d\n", err);
+        // sddf_dprintf("Failed to bind TCP PCB: %d\n", err);
         tcp_close(pcb);
         return;
     }
@@ -611,7 +610,7 @@ static void init_networking(void)
     net_buffers_init(&net_tx_queue, 0);
 
     sddf_lwip_init(&lib_sddf_lwip_config, &net_config, &timer_config, net_rx_queue, net_tx_queue, NULL,
-                   netif_status_callback, NULL);
+                   NULL, netif_status_callback, NULL, NULL, NULL);
     
     sddf_timer_set_timeout(timer_config.driver_id, 100 * NS_IN_MS);
     
@@ -659,7 +658,7 @@ void notified(microkit_channel ch)
     } else if (ch == serial_config.tx.id) {
         sddf_dprintf("serial TX notification received\n");
     } else {
-        sddf_dprintf("unknown channel notification: %lu\n", ch);
+        sddf_dprintf("unknown channel notification: %u\n", ch);
     }
 
     if (net_enabled) {

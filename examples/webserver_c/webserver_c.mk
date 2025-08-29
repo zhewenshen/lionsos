@@ -6,6 +6,7 @@
 #
 #
 BOARD_DIR := $(MICROKIT_SDK)/board/$(MICROKIT_BOARD)/$(MICROKIT_CONFIG)
+ARCH := $(shell grep 'CONFIG_SEL4_ARCH  ' $(BOARD_DIR)/include/kernel/gen_config.h | cut -d' ' -f4)
 SDDF := $(LIONSOS)/dep/sddf
 
 ifeq (${MICROKIT_BOARD},odroidc4)
@@ -34,10 +35,25 @@ LD := ld.lld
 AR := llvm-ar
 RANLIB := llvm-ranlib
 OBJCOPY := llvm-objcopy
-TARGET := aarch64-none-elf
 MICROKIT_TOOL ?= $(MICROKIT_SDK)/bin/microkit
 PYTHON ?= python3
 DTC := dtc
+
+ifeq ($(ARCH),aarch64)
+	CFLAGS_ARCH := -mcpu=$(CPU)
+	TARGET := aarch64-none-elf
+else ifeq ($(ARCH),riscv64)
+	CFLAGS_ARCH := -march=rv64imafdc
+	TARGET := riscv64-none-elf
+else
+$(error Unsupported ARCH given)
+endif
+
+ifeq ($(strip $(TOOLCHAIN)), clang)
+	CFLAGS_ARCH += -target $(TARGET)
+endif
+
+SDDF_CUSTOM_LIBC := 1
 
 NFS=$(LIONSOS)/components/fs/nfs
 MUSL_SRC := $(LIONSOS)/dep/musllibc
@@ -53,11 +69,10 @@ IMAGES := timer_driver.elf eth_driver.elf webserver_c.elf nfs.elf \
 	  network_virt_rx.elf network_virt_tx.elf \
 	  serial_driver.elf serial_virt_tx.elf
 
-${IMAGES}: libsddf_util_debug.a
-
 SYSTEM_FILE := webserver_c.system
 
 CFLAGS := \
+	-I$(MUSL)/include \
 	-mtune=$(CPU) \
 	-mstrict-align \
 	-ffreestanding \
@@ -67,41 +82,50 @@ CFLAGS := \
 	-Wall \
 	-Wno-unused-function \
 	-I$(BOARD_DIR)/include \
-	-target $(TARGET) \
+	$(CFLAGS_ARCH) \
 	-DBOARD_$(MICROKIT_BOARD) \
 	-I$(LIONSOS)/include \
 	-I$(SDDF)/include \
 	-I$(SDDF)/include/microkit \
 	-I$(WEBSERVER_C_SRC_DIR) \
-	-I$(WEBSERVER_C_SRC_DIR)/lwip_include \
 	-I$(LWIP)/include \
 	-I$(LWIP)/include/ipv4 \
-	-DWEB_ROOT_DIR=\"$(WEBSITE_DIR)\"
+	-DWEB_ROOT_DIR=\"$(WEBSITE_DIR)\" \
+	-DCONFIG_DEBUG_BUILD
 
 LDFLAGS := -L$(BOARD_DIR)/lib
-LIBS := -lmicrokit -Tmicrokit.ld libsddf_util.a
+LIBS := -lmicrokit -Tmicrokit.ld libsddf_util_debug.a
 
 IMAGE_FILE := webserver_c.img
 REPORT_FILE := report.txt
 
 all: $(IMAGE_FILE)
-${IMAGES}: libsddf_util.a $(MUSL)/lib/libc.a
+${IMAGES}: libsddf_util.a libsddf_util_debug.a
 
-CHECK_FLAGS_BOARD_MD5:=.board_cflags-$(shell echo -- ${CFLAGS} ${BOARD} ${MICROKIT_CONFIG} | shasum | sed 's/ *-//')
+LIB_SDDF_LWIP_CFLAGS_webserver_c := \
+	-I$(WEBSERVER_C_SRC_DIR)/lwip_include \
+	-I$(SDDF)/network/ipstacks/lwip/src/include \
+	-Wno-tautological-constant-out-of-range-compare
 
-${CHECK_FLAGS_BOARD_MD5}:
-	-rm -f .board_cflags-*
-	touch $@
 
 SDDF_MAKEFILES := ${SDDF}/util/util.mk \
 		  ${SDDF}/drivers/timer/${TIMER_DRIVER_DIR}/timer_driver.mk \
 		  ${SDDF}/drivers/network/${ETHERNET_DRIVER_DIR}/eth_driver.mk \
 		  ${SDDF}/drivers/serial/${SERIAL_DRIVER_DIR}/serial_driver.mk \
 		  ${SDDF}/network/components/network_components.mk \
+		  ${SDDF}/network/lib_sddf_lwip/lib_sddf_lwip.mk \
 		  ${SDDF}/serial/components/serial_components.mk
 
 include ${SDDF_MAKEFILES}
 include $(NFS)/nfs.mk
+
+
+
+CHECK_FLAGS_BOARD_MD5:=.board_cflags-$(shell echo -- ${CFLAGS} ${BOARD} ${MICROKIT_CONFIG} | shasum | sed 's/ *-//')
+
+${CHECK_FLAGS_BOARD_MD5}:
+	-rm -f .board_cflags-*
+	touch $@
 
 
 $(MUSL):
@@ -121,9 +145,10 @@ $(WEBSERVER_DIRS):
 
 webserver_c.elf: LDFLAGS += -L$(LIBGCC)
 webserver_c.elf: LIBS += -lgcc
-webserver_c.elf: $(WEBSERVER_OBJ) libsddf_util.a lib_sddf_lwip.a $(MUSL)/lib/libc.a
-	$(LD) $(LDFLAGS) -o $@ $(LIBS) $^
+webserver_c.elf: $(WEBSERVER_OBJ) libsddf_util.a lib_sddf_lwip_webserver_c.a $(MUSL)/lib/libc.a
+	$(LD) $(LDFLAGS) -o $@ -lmicrokit -Tmicrokit.ld -lgcc $^
 
+$(WEBSERVER_OBJ): CFLAGS += -I$(WEBSERVER_C_SRC_DIR)/lwip_include
 $(WEBSERVER_OBJ): $(CHECK_FLAGS_BOARD_MD5)
 $(WEBSERVER_OBJ): $(MUSL)/lib/libc.a
 $(WEBSERVER_OBJ): |$(WEBSERVER_DIRS)
@@ -170,6 +195,7 @@ $(SYSTEM_FILE): $(DTB) $(METAPROGRAM) $(IMAGES)
 	$(OBJCOPY) --update-section .serial_client_config=serial_client_nfs.data nfs.elf
 	$(OBJCOPY) --update-section .fs_server_config=fs_server_nfs.data nfs.elf
 	$(OBJCOPY) --update-section .nfs_config=nfs_config.data nfs.elf
+	$(OBJCOPY) --update-section .lib_sddf_lwip_config=lib_sddf_lwip_config_nfs.data nfs.elf
 
 $(IMAGE_FILE): $(IMAGES) $(SYSTEM_FILE)
 	$(MICROKIT_TOOL) $(SYSTEM_FILE) --search-path $(BUILD_DIR) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) -o $(IMAGE_FILE) -r $(REPORT_FILE)
@@ -191,9 +217,11 @@ ${SDDF_MAKEFILES} &:
 ${MUSL_SRC}/Makefile:
 	cd ${LIONSOS}; git submodule update --init dep/musllibc
 
-LIB_SDDF_LWIP_CFLAGS := $(CFLAGS) -I$(MUSL)/include
-include ${SDDF}/network/lib_sddf_lwip/lib_sddf_lwip.mk
+LIB_SDDF_LWIP_CFLAGS_webserver_c := \
+	-I$(WEBSERVER_C_SRC_DIR)/lwip_include \
+	-I$(SDDF)/network/ipstacks/lwip/src/include \
+	-Wno-tautological-constant-out-of-range-compare
 
-lib_sddf_lwip.a: $(MUSL)/lib/libc.a
+lib_sddf_lwip_webserver_c.a: $(MUSL)/lib/libc.a
 
 -include $(WEBSERVER_OBJ:.o=.d)

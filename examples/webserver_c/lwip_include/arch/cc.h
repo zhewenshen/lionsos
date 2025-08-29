@@ -7,6 +7,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>
+#include <sddf/util/printf.h>
 
 typedef uint8_t u8_t;
 typedef int8_t s8_t;
@@ -19,6 +21,16 @@ typedef int64_t s64_t;
 
 typedef uintptr_t mem_ptr_t;
 
+#ifndef SSIZE_MAX
+/* Whilst ssize_t is defined by sys/types.h, at least on aarch64-none-elf GCC
+   version 14.2.1 SSIZE_MAX is not defined.
+
+   If SSIZE_MAX is not defined then we take (SIZE_MAX - 1)/2 under the
+   assumption that ssize_t and size_t are related in the standard way.
+*/
+#define SSIZE_MAX ((SIZE_MAX - 1) >> 1)
+#endif
+
 #define LWIP_ERR_T int
 
 #define U16_F "hu"
@@ -29,8 +41,19 @@ typedef uintptr_t mem_ptr_t;
 #define X32_F "x"
 #define SZT_F "zu"
 
-#define LWIP_PLATFORM_DIAG(x) do { sddf_printf_ x; } while(0)
-#define LWIP_PLATFORM_ASSERT(x) do { sddf_printf_("Assertion \"%s\" failed at line %d in %s\n", x, __LINE__, __FILE__); for(;;); } while(0)
+#define LWIP_PLATFORM_DIAG(x)                                                  \
+        do {                                                                   \
+            sddf_dprintf x ;                                                   \
+        } while(0)
+
+#define LWIP_PLATFORM_ASSERT(x)                                                \
+        do {                                                                   \
+            if (!x) {                                                          \
+                sddf_dprintf("assertion violated: %s : %s:%d:%s\n",            \
+                       #x, __FILE__, __LINE__, __FUNCTION__);                  \
+                while(1);                                                      \
+            }                                                                  \
+        } while(0)
 
 #define PACK_STRUCT_FIELD(x) x
 #define PACK_STRUCT_STRUCT __attribute__((packed))
@@ -39,5 +62,6 @@ typedef uintptr_t mem_ptr_t;
 
 #define LWIP_RAND() ((u32_t)rand())
 
-int sddf_printf_(const char *format, ...) __attribute__((format(__printf__, 1, 2)));
+#define LWIP_NO_LIMITS_H 1
+
 int rand(void);

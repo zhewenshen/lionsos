@@ -72,12 +72,13 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
     net_virt_rx = ProtectionDomain("net_virt_rx", "network_virt_rx.elf", priority=99)
     net_system = Sddf.Net(sdf, ethernet_node, ethernet_driver, net_virt_tx, net_virt_rx)
 
-    webserver = ProtectionDomain("webserver_c", "webserver_c.elf", priority=50, budget=20000)
+    webserver = ProtectionDomain("webserver_c", "webserver_c.elf", priority=1, budget=20000)
     webserver_net_copier = ProtectionDomain("webserver_net_copier", "network_copy_webserver.elf", priority=97, budget=20000)
 
     serial_system.add_client(webserver)
     timer_system.add_client(webserver)
     net_system.add_client_with_copier(webserver, webserver_net_copier)
+    webserver_lwip = Sddf.Lwip(sdf, net_system, webserver)
 
     nfs = ProtectionDomain("nfs", "nfs.elf", priority=96, stack_size=0x10000)
     nfs_net_copier = ProtectionDomain("nfs_net_copier", "network_copy_nfs.elf", priority=97, budget=20000)
@@ -93,6 +94,7 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
         server=args.nfs_server,
         export_path=args.nfs_dir,
     )
+    nfs_lwip = Sddf.Lwip(sdf, net_system, nfs)
 
     pds = [
         serial_driver,
@@ -108,8 +110,6 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
     ]
     for pd in pds:
         sdf.add_pd(pd)
-
-    webserver_lwip = Sddf.Lwip(sdf, net_system, webserver)
     
     assert fs.connect()
     assert fs.serialise_config(output_dir)
@@ -121,6 +121,8 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
     assert timer_system.serialise_config(output_dir)
     assert webserver_lwip.connect()
     assert webserver_lwip.serialise_config(output_dir)
+    assert nfs_lwip.connect()
+    assert nfs_lwip.serialise_config(output_dir)
 
     with open(f"{output_dir}/{sdf_path}", "w+") as f:
         f.write(sdf.render())
