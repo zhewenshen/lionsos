@@ -32,7 +32,7 @@ if ! sudo iptables -L INPUT -n | grep -q "dpt:2049"; then
 fi
 
 echo "Building C webserver..."
-make -j8
+make -j$(nproc)
 
 echo "Starting QEMU with C webserver..."
 make qemu
