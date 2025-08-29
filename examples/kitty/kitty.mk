@@ -10,12 +10,12 @@ LD := ld.lld
 RANLIB := llvm-ranlib
 AR := llvm-ar
 OBJCOPY := llvm-objcopy
-TARGET := aarch64-none-elf
 MICROKIT_TOOL ?= $(MICROKIT_SDK)/bin/microkit
 PYTHON ?= python3
 DTC := dtc
 
 BOARD_DIR := $(MICROKIT_SDK)/board/$(MICROKIT_BOARD)/$(MICROKIT_CONFIG)
+ARCH := $(shell grep 'CONFIG_SEL4_ARCH  ' $(BOARD_DIR)/include/kernel/gen_config.h | cut -d' ' -f4)
 SDDF := $(LIONSOS)/dep/sddf
 LIBVMM_DIR := $(LIONSOS)/dep/libvmm
 
@@ -38,6 +38,23 @@ else ifeq ($(strip $(MICROKIT_BOARD)), qemu_virt_aarch64)
 else
 $(error Unsupported MICROKIT_BOARD given)
 endif
+
+ifeq ($(ARCH),aarch64)
+	CFLAGS_ARCH := -mcpu=$(CPU)
+	TARGET := aarch64-none-elf
+else ifeq ($(ARCH),riscv64)
+	CFLAGS_ARCH := -march=rv64imafdc
+	TARGET := riscv64-none-elf
+else
+$(error Unsupported ARCH given)
+endif
+
+ifeq ($(strip $(TOOLCHAIN)), clang)
+	CFLAGS_ARCH += -target $(TARGET)
+endif
+
+# Use sDDF custom libc for sDDF components
+SDDF_CUSTOM_LIBC := 1
 
 # If the KITTY_CONFIG is in deploy, then we will set the exec module
 # of Micropython to be the "deploy.py" file resident in the client directory.
@@ -86,7 +103,7 @@ CFLAGS := \
 	-Wall \
 	-Wno-unused-function \
 	-I$(BOARD_DIR)/include \
-	-target $(TARGET) \
+	$(CFLAGS_ARCH) \
 	-DBOARD_$(MICROKIT_BOARD) \
 	-I$(LIONSOS)/include \
 	-I$(SDDF)/include \
@@ -115,6 +132,7 @@ SDDF_MAKEFILES := ${SDDF}/util/util.mk \
 	${SDDF}/drivers/network/${NET_DRIV_DIR}/eth_driver.mk \
 	${SDDF}/drivers/serial/${SERIAL_DRIVER_DIR}/serial_driver.mk \
 	${SDDF}/network/components/network_components.mk \
+	${SDDF}/network/lib_sddf_lwip/lib_sddf_lwip.mk \
 	${SDDF}/serial/components/serial_components.mk \
 	${SDDF}/i2c/components/i2c_virt.mk \
 	${SDDF}/libco/libco.mk
@@ -162,7 +180,6 @@ vmm.elf: ${VMM_OBJS} libvmm.a
 nproc=2
 
 MICROPYTHON_LIBMATH := ${LIBMATH}
-MICROPYTHON_CONFIG_INCLUDE := $(CONFIG_INCLUDE)
 MICROPYTHON_FROZEN_MANIFEST := manifest.py
 MICROPYTHON_ENABLE_FRAMEBUFFER := 1
 include $(MICROPYTHON)/micropython.mk
@@ -213,6 +230,8 @@ $(SYSTEM_FILE): $(METAPROGRAM) $(IMAGES) $(DTB)
 	$(OBJCOPY) --update-section .fs_server_config=fs_server_nfs.data nfs.elf
 	$(OBJCOPY) --update-section .fs_client_config=fs_client_micropython.data micropython.elf
 	$(OBJCOPY) --update-section .vmm_config=vmm_framebuffer_vmm.data vmm.elf
+	$(OBJCOPY) --update-section .lib_sddf_lwip_config=lib_sddf_lwip_config_nfs.data nfs.elf
+	$(OBJCOPY) --update-section .lib_sddf_lwip_config=lib_sddf_lwip_config_micropython.data micropython.elf
 
 $(IMAGE_FILE) $(REPORT_FILE): $(IMAGES) $(SYSTEM_FILE)
 	$(MICROKIT_TOOL) $(SYSTEM_FILE) --search-path $(BUILD_DIR) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) -o $(IMAGE_FILE) -r $(REPORT_FILE)

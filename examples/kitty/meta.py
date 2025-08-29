@@ -8,7 +8,7 @@ from typing import List, Tuple, Optional
 from sdfgen import SystemDescription, Sddf, Vmm, DeviceTree, LionsOs
 from importlib.metadata import version
 
-assert version('sdfgen').split(".")[1] == "23", "Unexpected sdfgen version"
+assert version('sdfgen').split(".")[1] == "26", "Unexpected sdfgen version"
 
 ProtectionDomain = SystemDescription.ProtectionDomain
 VirtualMachine = SystemDescription.VirtualMachine
@@ -67,8 +67,8 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
         i2c_virt = ProtectionDomain("i2c_virt", "i2c_virt.elf", priority=2)
         # Right now we do not have separate clk and GPIO drivers and so our I2C driver does manual
         # clk/GPIO setup for I2C.
-        clk_mr = MemoryRegion("clk", 0x2000, paddr=0xff63c000) # @alwin: Changed this to 0x2000 so that it is equal to vmm bus2
-        gpio_mr = MemoryRegion("gpio", 0x3000, paddr=0xff634000) # @alwin: The VM touches SOMETHING at 0xff6346ec
+        clk_mr = MemoryRegion(sdf, "clk", 0x2000, paddr=0xff63c000) # @alwin: Changed this to 0x2000 so that it is equal to vmm bus2
+        gpio_mr = MemoryRegion(sdf, "gpio", 0x3000, paddr=0xff634000) # @alwin: The VM touches SOMETHING at 0xff6346ec
         sdf.add_mr(clk_mr)
         sdf.add_mr(gpio_mr)
         i2c_driver.add_map(Map(clk_mr, 0x30_000_000, "rw", cached=False))
@@ -94,6 +94,7 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
     serial_system.add_client(micropython)
     timer_system.add_client(micropython)
     net_system.add_client_with_copier(micropython, micropython_net_copier)
+    micropython_lib_sddf_lwip = Sddf.Lwip(sdf, net_system, micropython)
     if board.i2c:
         i2c_system.add_client(micropython)
 
@@ -112,11 +113,12 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
         server=args.nfs_server,
         export_path=args.nfs_dir,
     )
+    nfs_lib_sddf_lwip = Sddf.Lwip(sdf, net_system, nfs)
 
     vmm = ProtectionDomain("framebuffer_vmm", "vmm.elf", priority=1)
     vm = VirtualMachine("linux", [VirtualMachine.Vcpu(id=0)])
     vmm_system = Vmm(sdf, vmm, vm, guest_dtb, one_to_one_ram=True)
-    framebuffer = MemoryRegion("framebuffer", 0x2_000_000)
+    framebuffer = MemoryRegion(sdf, "framebuffer", 0x2_000_000)
     sdf.add_mr(framebuffer)
     framebuffer_map = Map(framebuffer, 0x30000000, "rw")
     micropython.add_map(framebuffer_map)
@@ -187,7 +189,7 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
         vmm_system.add_passthrough_irq(irq)
 
     for d in devices:
-        mr = MemoryRegion(d[0], d[1], paddr=d[2])
+        mr = MemoryRegion(sdf, d[0], d[1], paddr=d[2])
         sdf.add_mr(mr)
         vm.add_map(Map(mr, d[2], "rw", cached=False))
 
@@ -223,6 +225,10 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
         assert i2c_system.serialise_config(output_dir)
     assert vmm_system.connect()
     assert vmm_system.serialise_config(output_dir)
+    assert micropython_lib_sddf_lwip.connect()
+    assert micropython_lib_sddf_lwip.serialise_config(output_dir)
+    assert nfs_lib_sddf_lwip.connect()
+    assert nfs_lib_sddf_lwip.serialise_config(output_dir)
 
     with open(f"{output_dir}/{sdf_path}", "w+") as f:
         f.write(sdf.render())
