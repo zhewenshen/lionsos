@@ -113,7 +113,7 @@ $(MUSL)/lib/libc.a $(MUSL)/include: ${MUSL_SRC}/Makefile ${MUSL}
 
 WEBSERVER_DIRS := webserver
 
-WEBSERVER_FILES := webserver.c picohttpparser.c
+WEBSERVER_FILES := webserver.c picohttpparser.c utils.c
 WEBSERVER_OBJ := $(addprefix webserver/, $(WEBSERVER_FILES:.c=.o))
 
 $(WEBSERVER_DIRS):

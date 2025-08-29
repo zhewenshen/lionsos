@@ -40,6 +40,7 @@
 #include <string.h>
 
 #include "picohttpparser.h"
+#include "utils.h"
 
 __attribute__((__section__(".serial_client_config"))) serial_client_config_t serial_config;
 __attribute__((__section__(".timer_client_config"))) timer_client_config_t timer_config;
@@ -301,30 +302,31 @@ static void parse_http_request(http_request_t *req)
         return;
     }
 
-    if (actual_path_len > 0 && path[actual_path_len - 1] == '/') {
-        int result = snprintf(req->path, sizeof(req->path), "%.*sindex.html", (int)actual_path_len, path);
-        if (result >= sizeof(req->path)) {
-            send_http_error(req->pcb, 414, "URI Too Long");
-            req->state = REQUEST_STATE_CLOSING;
-            return;
-        }
-    } else {
-        if (actual_path_len >= sizeof(req->path)) {
-            send_http_error(req->pcb, 414, "URI Too Long");
-            req->state = REQUEST_STATE_CLOSING;
-            return;
-        }
-        memcpy(req->path, path, actual_path_len);
-        req->path[actual_path_len] = '\0';
-    }
-
-    snprintf(req->version, sizeof(req->version), "1.%d", minor_version);
-
-    if (strstr(req->path, "..") != NULL) {
-        send_http_error(req->pcb, 404, "Not Found");
+    if (actual_path_len >= sizeof(req->path)) {
+        send_http_error(req->pcb, 414, "URI Too Long");
         req->state = REQUEST_STATE_CLOSING;
         return;
     }
+    memcpy(req->path, path, actual_path_len);
+    req->path[actual_path_len] = '\0';
+
+    int norm_result = normalize_path(req->path, actual_path_len);
+    if (norm_result < 0) {
+        send_http_error(req->pcb, 400, "Bad Request");
+        req->state = REQUEST_STATE_CLOSING;
+        return;
+    }
+
+    if (req->path[norm_result - 1] == '/') {
+        if (norm_result + 10 >= sizeof(req->path)) {
+            send_http_error(req->pcb, 414, "URI Too Long");
+            req->state = REQUEST_STATE_CLOSING;
+            return;
+        }
+        strcat(req->path, "index.html");
+    }
+
+    snprintf(req->version, sizeof(req->version), "1.%d", minor_version);
 
     req->state = REQUEST_STATE_OPENING_FILE;
 }
