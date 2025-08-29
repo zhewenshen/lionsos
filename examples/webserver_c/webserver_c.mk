@@ -111,31 +111,23 @@ $(MUSL)/lib/libc.a $(MUSL)/include: ${MUSL_SRC}/Makefile ${MUSL}
 	cd ${MUSL} && CC=aarch64-none-elf-gcc CROSS_COMPILE=aarch64-none-elf- ${MUSL_SRC}/configure --srcdir=${MUSL_SRC} --prefix=${abspath ${MUSL}} --target=aarch64 --with-malloc=oldmalloc --enable-warnings --disable-shared --enable-static
 	${MAKE} -C ${MUSL} install
 
-include $(LWIP)/Filelists.mk
-WEBSERVER_NETIFFILES := $(LWIPDIR)/netif/ethernet.c
-WEBSERVER_LWIPFILES := $(COREFILES) $(CORE4FILES) $(WEBSERVER_NETIFFILES)
-WEBSERVER_LWIP_OBJ := $(addprefix webserver/lwip/, $(WEBSERVER_LWIPFILES:.c=.o))
-
-WEBSERVER_DIRS := webserver $(addprefix webserver/lwip/, api core core/ipv4 netif)
+WEBSERVER_DIRS := webserver
 
 WEBSERVER_FILES := webserver.c picohttpparser.c
-WEBSERVER_OBJ := $(addprefix webserver/, $(WEBSERVER_FILES:.c=.o)) $(WEBSERVER_LWIP_OBJ)
+WEBSERVER_OBJ := $(addprefix webserver/, $(WEBSERVER_FILES:.c=.o))
 
 $(WEBSERVER_DIRS):
 	mkdir -p $@
 
 webserver_c.elf: LDFLAGS += -L$(LIBGCC)
 webserver_c.elf: LIBS += -lgcc
-webserver_c.elf: $(WEBSERVER_OBJ) libsddf_util.a
+webserver_c.elf: $(WEBSERVER_OBJ) libsddf_util.a lib_sddf_lwip.a $(MUSL)/lib/libc.a
 	$(LD) $(LDFLAGS) -o $@ $(LIBS) $^
 
 $(WEBSERVER_OBJ): $(CHECK_FLAGS_BOARD_MD5)
 $(WEBSERVER_OBJ): $(MUSL)/lib/libc.a
 $(WEBSERVER_OBJ): |$(WEBSERVER_DIRS)
 $(WEBSERVER_OBJ): CFLAGS += -I$(MUSL)/include
-
-webserver/lwip/%.o: $(LWIP)/%.c
-	$(CC) -c $(CFLAGS) $< -o $@
 
 webserver/%.o: $(WEBSERVER_C_SRC_DIR)/%.c
 	$(CC) -c $(CFLAGS) $< -o $@
@@ -172,6 +164,7 @@ $(SYSTEM_FILE): $(DTB) $(METAPROGRAM) $(IMAGES)
 	$(OBJCOPY) --update-section .net_client_config=net_client_webserver_c.data webserver_c.elf
 	$(OBJCOPY) --update-section .serial_client_config=serial_client_webserver_c.data webserver_c.elf
 	$(OBJCOPY) --update-section .fs_client_config=fs_client_webserver_c.data webserver_c.elf
+	$(OBJCOPY) --update-section .lib_sddf_lwip_config=lib_sddf_lwip_config_webserver_c.data webserver_c.elf
 	$(OBJCOPY) --update-section .net_client_config=net_client_nfs.data nfs.elf
 	$(OBJCOPY) --update-section .timer_client_config=timer_client_nfs.data nfs.elf
 	$(OBJCOPY) --update-section .serial_client_config=serial_client_nfs.data nfs.elf
@@ -197,5 +190,10 @@ ${SDDF_MAKEFILES} &:
 
 ${MUSL_SRC}/Makefile:
 	cd ${LIONSOS}; git submodule update --init dep/musllibc
+
+LIB_SDDF_LWIP_CFLAGS := $(CFLAGS) -I$(MUSL)/include
+include ${SDDF}/network/lib_sddf_lwip/lib_sddf_lwip.mk
+
+lib_sddf_lwip.a: $(MUSL)/lib/libc.a
 
 -include $(WEBSERVER_OBJ:.o=.d)

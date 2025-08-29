@@ -109,6 +109,8 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
     for pd in pds:
         sdf.add_pd(pd)
 
+    webserver_lwip = Sddf.Lwip(sdf, net_system, webserver)
+    
     assert fs.connect()
     assert fs.serialise_config(output_dir)
     assert serial_system.connect()
@@ -117,6 +119,8 @@ def generate(sdf_path: str, output_dir: str, dtb: DeviceTree):
     assert net_system.serialise_config(output_dir)
     assert timer_system.connect()
     assert timer_system.serialise_config(output_dir)
+    assert webserver_lwip.connect()
+    assert webserver_lwip.serialise_config(output_dir)
 
     with open(f"{output_dir}/{sdf_path}", "w+") as f:
         f.write(sdf.render())

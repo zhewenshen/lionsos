@@ -23,6 +23,7 @@
 #include <netif/etharp.h>
 #include <sddf/network/config.h>
 #include <sddf/network/constants.h>
+#include <sddf/network/lib_sddf_lwip.h>
 #include <sddf/network/queue.h>
 #include <sddf/network/util.h>
 #include <sddf/serial/config.h>
@@ -44,6 +45,7 @@ __attribute__((__section__(".serial_client_config"))) serial_client_config_t ser
 __attribute__((__section__(".timer_client_config"))) timer_client_config_t timer_config;
 __attribute__((__section__(".net_client_config"))) net_client_config_t net_config;
 __attribute__((__section__(".fs_client_config"))) fs_client_config_t fs_config;
+__attribute__((__section__(".lib_sddf_lwip_config"))) lib_sddf_lwip_config_t lib_sddf_lwip_config;
 
 serial_queue_handle_t serial_tx_queue_handle;
 net_queue_handle_t net_rx_queue;
@@ -53,25 +55,7 @@ fs_queue_t *fs_command_queue;
 fs_queue_t *fs_completion_queue;
 char *fs_share;
 
-typedef struct pbuf_custom_offset {
-    struct pbuf_custom custom;
-    size_t offset;
-} pbuf_custom_offset_t;
-
-typedef struct network_state {
-    struct netif netif;
-    uint8_t mac[6];
-} network_state_t;
-
-static network_state_t net_state;
-static bool notify_tx = false;
-static bool notify_rx = false;
 static bool net_enabled = false;
-
-LWIP_MEMPOOL_DECLARE(RX_POOL, 512 * 2, sizeof(pbuf_custom_offset_t), "zero-copy RX pool");
-
-struct pbuf *pbuf_head;
-struct pbuf *pbuf_tail;
 
 static http_request_t requests[MAX_CONCURRENT_REQUESTS];
 static bool fs_initialized = false;
@@ -355,24 +339,9 @@ static void process_file_operations(void)
         if (completion.id == 0 && !fs_initialized) {
             if (completion.status == FS_STATUS_SUCCESS) {
                 fs_initialized = true;
-
-                if (net_enabled && dhcp_supplied_address(&net_state.netif)) {
-                    static bool http_server_started = false;
-                    if (!http_server_started) {
-                        struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-                        if (pcb != NULL) {
-                            err_t error = tcp_bind(pcb, IP_ANY_TYPE, HTTP_PORT);
-                            if (!error) {
-                                pcb = tcp_listen_with_backlog_and_err(pcb, 8, &error);
-                                if (!error) {
-                                    tcp_accept(pcb, http_accept);
-                                    http_server_started = true;
-                                }
-                            }
-                        }
-                    }
-                }
+                sddf_dprintf("File system initialized\n");
             } else {
+                sddf_dprintf("File system initialization failed\n");
             }
             continue;
         }
@@ -599,103 +568,36 @@ static err_t http_poll(void *arg, struct tcp_pcb *pcb)
     return ERR_OK;
 }
 
-u32_t sys_now(void)
+
+static void setup_http_server(void)
 {
-    static u32_t time_counter = 0;
-    time_counter += 10;
-    return time_counter;
+    struct tcp_pcb *pcb = tcp_new();
+    if (pcb == NULL) {
+        sddf_dprintf("Failed to create TCP PCB\n");
+        return;
+    }
+
+    err_t err = tcp_bind(pcb, IP_ADDR_ANY, 80);
+    if (err != ERR_OK) {
+        sddf_dprintf("Failed to bind TCP PCB: %d\n", err);
+        tcp_close(pcb);
+        return;
+    }
+
+    pcb = tcp_listen(pcb);
+    if (pcb == NULL) {
+        sddf_dprintf("Failed to listen on TCP PCB\n");
+        return;
+    }
+
+    tcp_accept(pcb, http_accept);
+    sddf_dprintf("HTTP server listening on port 80\n");
 }
 
-static void interface_free_buffer(struct pbuf *buf)
+static void netif_status_callback(char *ip_addr)
 {
-    SYS_ARCH_DECL_PROTECT(old_level);
-    pbuf_custom_offset_t *custom_pbuf_offset = (pbuf_custom_offset_t *)buf;
-    SYS_ARCH_PROTECT(old_level);
-    net_buff_desc_t buffer = { custom_pbuf_offset->offset, 0 };
-    net_enqueue_free(&net_rx_queue, buffer);
-    notify_rx = true;
-    LWIP_MEMPOOL_FREE(RX_POOL, custom_pbuf_offset);
-    SYS_ARCH_UNPROTECT(old_level);
-}
-
-static err_t netif_output(struct netif *netif, struct pbuf *p)
-{
-    err_t ret = ERR_OK;
-
-    if (p->tot_len > NET_BUFFER_SIZE) {
-        return ERR_MEM;
-    }
-
-    net_buff_desc_t buffer;
-    int err = net_dequeue_free(&net_tx_queue, &buffer);
-    if (err) {
-        return ERR_MEM;
-    }
-
-    unsigned char *frame = (unsigned char *)(buffer.io_or_offset + net_config.tx_data.vaddr);
-    unsigned int copied = 0;
-    for (struct pbuf *curr = p; curr != NULL; curr = curr->next) {
-        memcpy(frame + copied, curr->payload, curr->len);
-        copied += curr->len;
-    }
-
-    buffer.len = copied;
-    err = net_enqueue_active(&net_tx_queue, buffer);
-    assert(!err);
-    notify_tx = true;
-
-    return ret;
-}
-
-static void netif_status_callback(struct netif *netif)
-{
-    static bool http_server_started = false;
-
-    if (dhcp_supplied_address(netif) && !http_server_started) {
-        if (fs_initialized) {
-            struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-            if (pcb == NULL) {
-                return;
-            }
-
-            err_t error = tcp_bind(pcb, IP_ANY_TYPE, HTTP_PORT);
-            if (error) {
-                return;
-            }
-
-            pcb = tcp_listen_with_backlog_and_err(pcb, 8, &error);
-            if (error) {
-                return;
-            }
-
-            tcp_accept(pcb, http_accept);
-            http_server_started = true;
-        }
-    }
-}
-
-static err_t ethernet_init(struct netif *netif)
-{
-    if (netif->state == NULL) {
-        return ERR_ARG;
-    }
-
-    network_state_t *data = netif->state;
-
-    netif->hwaddr[0] = data->mac[0];
-    netif->hwaddr[1] = data->mac[1];
-    netif->hwaddr[2] = data->mac[2];
-    netif->hwaddr[3] = data->mac[3];
-    netif->hwaddr[4] = data->mac[4];
-    netif->hwaddr[5] = data->mac[5];
-    netif->mtu = ETHER_MTU;
-    netif->hwaddr_len = ETHARP_HWADDR_LEN;
-    netif->output = etharp_output;
-    netif->linkoutput = netif_output;
-    NETIF_INIT_SNMP(netif, snmp_ifType_ethernet_csmacd, LINK_SPEED);
-    netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_LINK_UP | NETIF_FLAG_IGMP;
-
-    return ERR_OK;
+    sddf_dprintf("DHCP request finished, IP address for netif %s is: %s\n", "webserver_c", ip_addr);
+    setup_http_server();
 }
 
 static void init_networking(void)
@@ -706,104 +608,14 @@ static void init_networking(void)
                    net_config.tx.num_buffers);
     net_buffers_init(&net_tx_queue, 0);
 
-    lwip_init();
-    LWIP_MEMPOOL_INIT(RX_POOL);
-
-    for (int i = 0; i < 6; i++) {
-        net_state.mac[i] = net_config.mac_addr[i];
-    }
-
-    struct ip4_addr netmask, ipaddr, gw, multicast;
-    ipaddr_aton("0.0.0.0", &gw);
-    ipaddr_aton("0.0.0.0", &ipaddr);
-    ipaddr_aton("0.0.0.0", &multicast);
-    ipaddr_aton("255.255.255.0", &netmask);
-
-    net_state.netif.name[0] = 'e';
-    net_state.netif.name[1] = '0';
-
-    if (!netif_add(&(net_state.netif), &ipaddr, &netmask, &gw, &net_state, ethernet_init, ethernet_input)) {}
-    netif_set_default(&(net_state.netif));
-    netif_set_status_callback(&(net_state.netif), netif_status_callback);
-    netif_set_up(&(net_state.netif));
-
-    int err = dhcp_start(&(net_state.netif));
-    if (err) {}
-
-    if (notify_rx && net_require_signal_free(&net_rx_queue)) {
-        net_cancel_signal_free(&net_rx_queue);
-        notify_rx = false;
-        if (!microkit_have_signal) {
-            microkit_deferred_notify(net_config.rx.id);
-        } else if (microkit_signal_cap != BASE_OUTPUT_NOTIFICATION_CAP + net_config.rx.id) {
-            microkit_notify(net_config.rx.id);
-        }
-    }
-
-    if (notify_tx && net_require_signal_active(&net_tx_queue)) {
-        net_cancel_signal_active(&net_tx_queue);
-        notify_tx = false;
-        if (!microkit_have_signal) {
-            microkit_deferred_notify(net_config.tx.id);
-        } else if (microkit_signal_cap != BASE_OUTPUT_NOTIFICATION_CAP + net_config.tx.id) {
-            microkit_notify(net_config.tx.id);
-        }
-    }
+    sddf_lwip_init(&lib_sddf_lwip_config, &net_config, &timer_config, net_rx_queue, net_tx_queue, NULL,
+                   netif_status_callback, NULL);
+    
+    sddf_timer_set_timeout(timer_config.driver_id, 100 * NS_IN_MS);
+    
+    sddf_lwip_maybe_notify();
 }
 
-static void process_rx_packets(void)
-{
-    bool reprocess = true;
-    while (reprocess) {
-        while (!net_queue_empty_active(&net_rx_queue)) {
-            net_buff_desc_t buffer;
-            net_dequeue_active(&net_rx_queue, &buffer);
-
-            pbuf_custom_offset_t *custom_pbuf_offset = (pbuf_custom_offset_t *)LWIP_MEMPOOL_ALLOC(RX_POOL);
-            custom_pbuf_offset->offset = buffer.io_or_offset;
-            custom_pbuf_offset->custom.custom_free_function = interface_free_buffer;
-
-            struct pbuf *p = pbuf_alloced_custom(PBUF_RAW, buffer.len, PBUF_REF, &custom_pbuf_offset->custom,
-                                                 (void *)(buffer.io_or_offset + net_config.rx_data.vaddr),
-                                                 NET_BUFFER_SIZE);
-
-            if (net_state.netif.input(p, &net_state.netif) != ERR_OK) {
-                pbuf_free(p);
-            }
-        }
-
-        net_request_signal_active(&net_rx_queue);
-        reprocess = false;
-
-        if (!net_queue_empty_active(&net_rx_queue)) {
-            net_cancel_signal_active(&net_rx_queue);
-            reprocess = true;
-        }
-    }
-}
-
-static void handle_network_notifications(void)
-{
-    if (notify_rx && net_require_signal_free(&net_rx_queue)) {
-        net_cancel_signal_free(&net_rx_queue);
-        notify_rx = false;
-        if (!microkit_have_signal) {
-            microkit_deferred_notify(net_config.rx.id);
-        } else if (microkit_signal_cap != BASE_OUTPUT_NOTIFICATION_CAP + net_config.rx.id) {
-            microkit_notify(net_config.rx.id);
-        }
-    }
-
-    if (notify_tx && net_require_signal_active(&net_tx_queue)) {
-        net_cancel_signal_active(&net_tx_queue);
-        notify_tx = false;
-        if (!microkit_have_signal) {
-            microkit_deferred_notify(net_config.tx.id);
-        } else if (microkit_signal_cap != BASE_OUTPUT_NOTIFICATION_CAP + net_config.tx.id) {
-            microkit_notify(net_config.tx.id);
-        }
-    }
-}
 
 void init(void)
 {
@@ -832,20 +644,24 @@ void init(void)
 void notified(microkit_channel ch)
 {
     if (net_enabled && ch == net_config.rx.id) {
-        process_rx_packets();
+        sddf_lwip_process_rx();
     } else if (net_enabled && ch == net_config.tx.id) {
+        /* handled by lib_sddf_lwip */
     } else if (ch == timer_config.driver_id) {
         if (net_enabled) {
-            sys_check_timeouts();
+            sddf_lwip_process_timeout();
+            sddf_timer_set_timeout(timer_config.driver_id, 100 * NS_IN_MS);
         }
     } else if (ch == fs_config.server.id) {
         process_file_operations();
     } else if (ch == serial_config.tx.id) {
+        sddf_dprintf("serial TX notification received\n");
     } else {
+        sddf_dprintf("unknown channel notification: %lu\n", ch);
     }
 
     if (net_enabled) {
-        handle_network_notifications();
+        sddf_lwip_maybe_notify();
     }
 }
 

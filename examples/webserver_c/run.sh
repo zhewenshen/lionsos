@@ -5,7 +5,7 @@ export MICROKIT_BOARD=qemu_virt_aarch64
 export NFS_SERVER=10.0.2.2
 export NFS_DIRECTORY=/test
 export WEBSITE_DIR=www
-export MICROKIT_CONFIG=release
+export MICROKIT_CONFIG=debug
 
 if ! dpkg -l | grep -q nfs-kernel-server; then
     echo "Installing NFS server..."
