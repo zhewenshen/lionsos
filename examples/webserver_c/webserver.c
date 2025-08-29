@@ -64,8 +64,13 @@ static uint64_t request_id_stack[FS_QUEUE_CAPACITY - 1];
 static int request_id_stack_top = -1;
 static bool request_id_allocator_initialized = false;
 
-static http_request_t *request_free_list = NULL;
-static bool request_allocator_initialized = false;
+static uint32_t request_bitmap = 0; // 32 concurrent conns
+static int request_next_hint = 0;
+
+#define FS_BUFFER_COUNT (FS_QUEUE_CAPACITY * 2)
+#define FS_BITMAP_WORDS ((FS_BUFFER_COUNT + 63) / 64)
+static uint64_t fs_buffer_bitmap[FS_BITMAP_WORDS];
+static int fs_buffer_next_hint = 0;
 
 static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
 static void http_error(void *arg, err_t err);
@@ -137,31 +142,22 @@ static const char *content_type_from_extension(const char *path)
     return "application/octet-stream";
 }
 
-static void request_allocator_init(void)
-{
-    if (request_allocator_initialized)
-        return;
-
-    for (int i = 0; i < MAX_CONCURRENT_REQUESTS; i++) {
-        requests[i].pcb = (struct tcp_pcb *)request_free_list;
-        request_free_list = &requests[i];
-    }
-    request_allocator_initialized = true;
-}
-
 static http_request_t *request_alloc(void)
 {
-    if (!request_allocator_initialized) {
-        request_allocator_init();
-    }
-
-    if (request_free_list) {
-        http_request_t *req = request_free_list;
-        request_free_list = (http_request_t *)req->pcb;
-        memset(req, 0, sizeof(http_request_t));
-        req->in_use = true;
-        req->file_fd = UINT64_MAX;
-        return req;
+    int start = request_next_hint;
+    for (int i = 0; i < MAX_CONCURRENT_REQUESTS; i++) {
+        int idx = (start + i) % MAX_CONCURRENT_REQUESTS;
+        uint32_t mask = 1U << idx;
+        
+        if (!(request_bitmap & mask)) {
+            request_bitmap |= mask;
+            request_next_hint = (idx + 1) % MAX_CONCURRENT_REQUESTS;
+            
+            memset(&requests[idx], 0, sizeof(http_request_t));
+            requests[idx].in_use = true;
+            requests[idx].file_fd = UINT64_MAX;
+            return &requests[idx];
+        }
     }
     return NULL;
 }
@@ -193,8 +189,12 @@ static void request_free(http_request_t *req)
         req->fs_request_id = 0;
     }
 
-    req->pcb = (struct tcp_pcb *)request_free_list;
-    request_free_list = req;
+    int idx = req - requests;
+    if (idx >= 0 && idx < MAX_CONCURRENT_REQUESTS) {
+        uint32_t mask = 1U << idx;
+        request_bitmap &= ~mask;
+        request_next_hint = idx;
+    }
     req->in_use = false;
 }
 
@@ -666,15 +666,21 @@ void notified(microkit_channel ch)
 }
 
 /* fs buffer management */
-static ptrdiff_t fs_buffer_pool[FS_QUEUE_CAPACITY * 2];
-static bool fs_buffer_used[FS_QUEUE_CAPACITY * 2];
-
 ptrdiff_t fs_buffer_allocate(void)
 {
-    for (int i = 0; i < FS_QUEUE_CAPACITY * 2; i++) {
-        if (!fs_buffer_used[i]) {
-            fs_buffer_used[i] = true;
-            return i * FILE_READ_BUFFER_SIZE;
+    int start = fs_buffer_next_hint;
+    
+    for (int i = 0; i < FS_BUFFER_COUNT; i++) {
+        int idx = (start + i) % FS_BUFFER_COUNT;
+        int word_idx = idx / 64;
+        int bit_idx = idx % 64;
+        uint64_t mask = 1ULL << bit_idx;
+        
+        if (!(fs_buffer_bitmap[word_idx] & mask)) {
+            fs_buffer_bitmap[word_idx] |= mask;
+            fs_buffer_next_hint = (idx + 1) % FS_BUFFER_COUNT;
+
+            return idx * FILE_READ_BUFFER_SIZE;
         }
     }
     return -1;
@@ -682,8 +688,13 @@ ptrdiff_t fs_buffer_allocate(void)
 
 void fs_buffer_free(ptrdiff_t buffer)
 {
-    int index = buffer / FILE_READ_BUFFER_SIZE;
-    if (index >= 0 && index < FS_QUEUE_CAPACITY * 2) {
-        fs_buffer_used[index] = false;
+    int idx = buffer / FILE_READ_BUFFER_SIZE;
+    if (idx >= 0 && idx < FS_BUFFER_COUNT) {
+        int word_idx = idx / 64;
+        int bit_idx = idx % 64;
+        uint64_t mask = 1ULL << bit_idx;
+        
+        fs_buffer_bitmap[word_idx] &= ~mask;
+        fs_buffer_next_hint = idx;
     }
 }
