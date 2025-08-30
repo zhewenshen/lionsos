@@ -63,10 +63,8 @@ typedef struct http_request {
     bool in_use;
     bool is_head_request;
     
-    // Async operation tracking
     int outstanding_operations;
     bool connection_closed;
-    bool ready_for_cleanup;
     bool fs_operation_in_flight;
 
     char header_buffer[512];

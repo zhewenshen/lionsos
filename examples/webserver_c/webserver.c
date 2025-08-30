@@ -68,13 +68,86 @@ static int request_next_hint = 0;
 
 #define FS_BUFFER_COUNT (FS_QUEUE_CAPACITY * 2)
 #define FS_BITMAP_WORDS ((FS_BUFFER_COUNT + 63) / 64)
+
+#define FS_OP_SAFE(req) (!req->connection_closed && !req->fs_operation_in_flight)
+
+#define HTTP_ERROR_AND_CLOSE(req, code, msg) do { \
+    if (req->pcb) send_http_error(req->pcb, code, msg); \
+    request_close_connection(req); \
+} while(0)
+
+#define BITMAP_WORD(idx) ((idx) / 64)
+#define BITMAP_BIT(idx) ((idx) % 64)
+#define BITMAP_MASK(idx) (1ULL << BITMAP_BIT(idx))
+
+#define SUBMIT_FS_CMD(cmd) do { \
+    fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd; \
+    fs_queue_publish_production(fs_command_queue, 1); \
+    microkit_notify(fs_config.server.id); \
+} while(0)
+
 static uint64_t fs_buffer_bitmap[FS_BITMAP_WORDS];
 static int fs_buffer_next_hint = 0;
 
 static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
 static void http_error(void *arg, err_t err);
 static err_t http_poll(void *arg, struct tcp_pcb *pcb);
+static void request_start_operation(http_request_t *req);
+static void request_close_connection(http_request_t *req);
 
+static int bitmap_alloc(uint64_t *bitmap, int max_count, int *hint)
+{
+    int start = *hint;
+    for (int i = 0; i < max_count; i++) {
+        int idx = (start + i) % max_count;
+        uint64_t mask = BITMAP_MASK(idx);
+        
+        if (!(bitmap[BITMAP_WORD(idx)] & mask)) {
+            bitmap[BITMAP_WORD(idx)] |= mask;
+            *hint = (idx + 1) % max_count;
+            return idx;
+        }
+    }
+    return -1;
+}
+
+static void bitmap_free(uint64_t *bitmap, int idx, int max_count, int *hint)
+{
+    if (idx >= 0 && idx < max_count) {
+        bitmap[BITMAP_WORD(idx)] &= ~BITMAP_MASK(idx);
+        *hint = idx;
+    }
+}
+
+static void tcp_cleanup_callbacks(struct tcp_pcb *pcb)
+{
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    tcp_err(pcb, NULL);
+    tcp_poll(pcb, NULL, 0);
+}
+
+static void send_file_read_command(http_request_t *req, uint64_t offset, size_t size)
+{
+    request_start_operation(req);
+    fs_cmd_t cmd = { .type = FS_CMD_FILE_READ,
+                     .id = req->fs_request_id,
+                     .params.file_read = {
+                         .fd = req->file_fd,
+                         .offset = offset,
+                         .buf = { .offset = req->read_buffer, .size = size } } };
+    SUBMIT_FS_CMD(cmd);
+}
+
+static void finish_response_and_close(http_request_t *req)
+{
+    if (req->pcb) {
+        tcp_output(req->pcb);
+    }
+    request_close_connection(req);
+}
+
+/* TODO: fix id allocate */
 static void request_id_allocator_init(void)
 {
     request_id_allocator_initialized = true;
@@ -107,17 +180,28 @@ static void request_complete_operation(http_request_t *req)
     if (req && req->in_use) {
         req->outstanding_operations--;
         req->fs_operation_in_flight = false;
-        
-        
-        if (req->connection_closed && req->outstanding_operations == 0) {
-            req->ready_for_cleanup = true;
-        }
     }
 }
 
 static bool request_can_cleanup(http_request_t *req)
 {
     return req && req->in_use && req->connection_closed && req->outstanding_operations == 0;
+}
+
+static void free_request_buffers(http_request_t *req)
+{
+    if (req->path_buffer != -1) {
+        fs_buffer_free(req->path_buffer);
+        req->path_buffer = -1;
+    }
+    if (req->read_buffer != -1) {
+        fs_buffer_free(req->read_buffer);
+        req->read_buffer = -1;
+    }
+    if (req->stat_buffer != -1) {
+        fs_buffer_free(req->stat_buffer);
+        req->stat_buffer = -1;
+    }
 }
 
 static const char *content_type_from_extension(const char *path)
@@ -152,28 +236,16 @@ static const char *content_type_from_extension(const char *path)
 
 static http_request_t *request_alloc(void)
 {
-    int start = request_next_hint;
-    for (int i = 0; i < MAX_CONCURRENT_REQUESTS; i++) {
-        int idx = (start + i) % MAX_CONCURRENT_REQUESTS;
-        int word = idx / 64;
-        int bit = idx % 64;
-        uint64_t mask = 1ULL << bit;
-        
-        if (!(request_bitmap[word] & mask)) {
-            request_bitmap[word] |= mask;
-            request_next_hint = (idx + 1) % MAX_CONCURRENT_REQUESTS;
-            
-            memset(&requests[idx], 0, sizeof(http_request_t));
-            requests[idx].in_use = true;
-            requests[idx].file_fd = UINT64_MAX;
-            requests[idx].outstanding_operations = 0;
-            requests[idx].connection_closed = false;
-            requests[idx].ready_for_cleanup = false;
-            requests[idx].fs_operation_in_flight = false;
-            return &requests[idx];
-        }
-    }
-    return NULL;
+    int idx = bitmap_alloc(request_bitmap, MAX_CONCURRENT_REQUESTS, &request_next_hint);
+    if (idx == -1) return NULL;
+    
+    memset(&requests[idx], 0, sizeof(http_request_t));
+    requests[idx].in_use = true;
+    requests[idx].file_fd = UINT64_MAX;
+    requests[idx].outstanding_operations = 0;
+    requests[idx].connection_closed = false;
+    requests[idx].fs_operation_in_flight = false;
+    return &requests[idx];
 }
 
 static void request_close_connection(http_request_t *req)
@@ -182,20 +254,12 @@ static void request_close_connection(http_request_t *req)
         return;
         
     if (req->pcb) {
-        tcp_arg(req->pcb, NULL);
-        tcp_recv(req->pcb, NULL);
-        tcp_err(req->pcb, NULL);
-        tcp_poll(req->pcb, NULL, 0);
+        tcp_cleanup_callbacks(req->pcb);
         tcp_close(req->pcb);
         req->pcb = NULL;
     }
     
     req->connection_closed = true;
-    
-    
-    if (req->outstanding_operations == 0) {
-        req->ready_for_cleanup = true;
-    }
 }
 
 static void request_free(http_request_t *req)
@@ -203,41 +267,15 @@ static void request_free(http_request_t *req)
     if (!req || !req->in_use || !request_can_cleanup(req))
         return;
 
-    if (req->file_open && req->file_fd != UINT64_MAX && !req->fs_operation_in_flight && 
-        fs_queue_length_producer(fs_command_queue) < FS_QUEUE_CAPACITY && req->fs_request_id != 0) {
+    if (req->file_open && req->file_fd != UINT64_MAX && req->fs_request_id > 0) {
         fs_cmd_t cmd = { .type = FS_CMD_FILE_CLOSE, .id = req->fs_request_id, .params.file_close.fd = req->file_fd };
-        fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd;
-        fs_queue_publish_production(fs_command_queue, 1);
-        microkit_notify(fs_config.server.id);
+        SUBMIT_FS_CMD(cmd);
     }
 
-    if (req->pcb) {
-        tcp_arg(req->pcb, NULL);
-        tcp_recv(req->pcb, NULL);
-        tcp_err(req->pcb, NULL);
-        tcp_poll(req->pcb, NULL, 0);
-        tcp_close(req->pcb);
-        req->pcb = NULL;
-    }
-
-    if (req->path_buffer >= 0) {
-        fs_buffer_free(req->path_buffer);
-    }
-    if (req->read_buffer >= 0) {
-        fs_buffer_free(req->read_buffer);
-    }
-    if (req->stat_buffer >= 0) {
-        fs_buffer_free(req->stat_buffer);
-    }
+    free_request_buffers(req);
 
     int idx = req - requests;
-    if (idx >= 0 && idx < MAX_CONCURRENT_REQUESTS) {
-        int word = idx / 64;
-        int bit = idx % 64;
-        uint64_t mask = 1ULL << bit;
-        request_bitmap[word] &= ~mask;
-        request_next_hint = idx;
-    }
+    bitmap_free(request_bitmap, idx, MAX_CONCURRENT_REQUESTS, &request_next_hint);
     
     request_id_free(req->fs_request_id);
     req->in_use = false;
@@ -318,16 +356,14 @@ static void parse_http_request(http_request_t *req)
                                  &minor_version, headers, &num_headers, 0);
 
     if (pret == -1) {
-        send_http_error(req->pcb, 400, "Bad Request");
-        request_close_connection(req);
+        HTTP_ERROR_AND_CLOSE(req, 400, "Bad Request");
         return;
     } else if (pret == -2) {
         return;
     }
 
     if (method_len >= sizeof(req->method)) {
-        send_http_error(req->pcb, 400, "Bad Request");
-        request_close_connection(req);
+        HTTP_ERROR_AND_CLOSE(req, 400, "Bad Request");
         return;
     }
     memcpy(req->method, method, method_len);
@@ -337,8 +373,7 @@ static void parse_http_request(http_request_t *req)
     bool is_head = (method_len == 4 && memcmp(method, "HEAD", 4) == 0);
     
     if (!is_get && !is_head) {
-        send_http_error(req->pcb, 501, "Not Implemented");
-        request_close_connection(req);
+        HTTP_ERROR_AND_CLOSE(req, 501, "Not Implemented");
         return;
     }
     
@@ -348,14 +383,12 @@ static void parse_http_request(http_request_t *req)
     size_t actual_path_len = query ? (size_t)(query - path) : path_len;
 
     if (actual_path_len == 0 || path[0] != '/') {
-        send_http_error(req->pcb, 400, "Bad Request");
-        request_close_connection(req);
+        HTTP_ERROR_AND_CLOSE(req, 400, "Bad Request");
         return;
     }
 
     if (actual_path_len >= sizeof(req->path)) {
-        send_http_error(req->pcb, 414, "URI Too Long");
-        request_close_connection(req);
+        HTTP_ERROR_AND_CLOSE(req, 414, "URI Too Long");
         return;
     }
     memcpy(req->path, path, actual_path_len);
@@ -363,8 +396,7 @@ static void parse_http_request(http_request_t *req)
 
     int norm_result = normalize_path(req->path, actual_path_len);
     if (norm_result < 0) {
-        send_http_error(req->pcb, 400, "Bad Request");
-        request_close_connection(req);
+        HTTP_ERROR_AND_CLOSE(req, 400, "Bad Request");
         return;
     }
 
@@ -428,24 +460,18 @@ static void process_file_operations(void)
                 req->file_fd = completion.data.file_open.fd;
                 req->file_open = true;
 
-                if (!req->connection_closed && !req->fs_operation_in_flight && fs_queue_length_producer(fs_command_queue) < FS_QUEUE_CAPACITY) {
+                if (FS_OP_SAFE(req)) {
                     request_start_operation(req);
                     fs_cmd_t cmd = { .type = FS_CMD_FILE_SIZE,
                                      .id = req->fs_request_id,
                                      .params.file_size.fd = req->file_fd };
-                    fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd;
-                    fs_queue_publish_production(fs_command_queue, 1);
-                    microkit_notify(fs_config.server.id);
-
+                    SUBMIT_FS_CMD(cmd);
                     req->state = REQUEST_STATE_READING_FILE;
                 } else {
                     request_close_connection(req);
                 }
             } else {
-                if (req->pcb) {
-                    send_http_error(req->pcb, 404, "Not Found");
-                }
-                request_close_connection(req);
+                HTTP_ERROR_AND_CLOSE(req, 404, "Not Found");
             }
             break;
         }
@@ -455,18 +481,8 @@ static void process_file_operations(void)
                 if (req->file_size == 0) {
                     req->file_size = completion.data.file_size.size;
 
-                    if (!req->connection_closed && !req->fs_operation_in_flight && fs_queue_length_producer(fs_command_queue) < FS_QUEUE_CAPACITY) {
-                        request_start_operation(req);
-                        fs_cmd_t cmd = { .type = FS_CMD_FILE_READ,
-                                         .id = req->fs_request_id,
-                                         .params.file_read = {
-                                             .fd = req->file_fd,
-                                             .offset = 0,
-                                             .buf = { .offset = req->read_buffer,
-                                                      .size = MIN(FILE_READ_BUFFER_SIZE, req->file_size) } } };
-                        fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd;
-                        fs_queue_publish_production(fs_command_queue, 1);
-                        microkit_notify(fs_config.server.id);
+                    if (FS_OP_SAFE(req)) {
+                        send_file_read_command(req, 0, MIN(FILE_READ_BUFFER_SIZE, req->file_size));
                     } else {
                         request_close_connection(req);
                     }
@@ -484,8 +500,7 @@ static void process_file_operations(void)
                         req->headers_sent = true;
                         
                         if (req->is_head_request) {
-                            tcp_output(req->pcb);
-                            request_close_connection(req);
+                            finish_response_and_close(req);
                             break;
                         }
                     }
@@ -497,34 +512,16 @@ static void process_file_operations(void)
                     }
                     req->file_offset += bytes_read;
 
-                    if (req->file_offset < req->file_size && !req->connection_closed && !req->fs_operation_in_flight && fs_queue_length_producer(fs_command_queue) < FS_QUEUE_CAPACITY) {
-                        request_start_operation(req);
-                        fs_cmd_t cmd = { .type = FS_CMD_FILE_READ,
-                                         .id = req->fs_request_id,
-                                         .params.file_read = {
-                                             .fd = req->file_fd,
-                                             .offset = req->file_offset,
-                                             .buf = { .offset = req->read_buffer, .size = FILE_READ_BUFFER_SIZE } } };
-                        fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd;
-                        fs_queue_publish_production(fs_command_queue, 1);
-                        microkit_notify(fs_config.server.id);
+                    if (req->file_offset < req->file_size && FS_OP_SAFE(req)) {
+                        send_file_read_command(req, req->file_offset, FILE_READ_BUFFER_SIZE);
                     } else {
-                        if (req->pcb) {
-                            tcp_output(req->pcb);
-                        }
-                        request_close_connection(req);
+                        finish_response_and_close(req);
                     }
                 } else {
-                    if (req->pcb) {
-                        tcp_output(req->pcb);
-                    }
-                    request_close_connection(req);
+                    finish_response_and_close(req);
                 }
             } else {
-                if (req->pcb) {
-                    send_http_error(req->pcb, 500, "Internal Server Error");
-                }
-                request_close_connection(req);
+                HTTP_ERROR_AND_CLOSE(req, 500, "Internal Server Error");
             }
             break;
         }
@@ -538,7 +535,7 @@ static void process_file_operations(void)
     fs_queue_publish_consumption(fs_completion_queue, to_consume);
     
     for (int i = 0; i < MAX_CONCURRENT_REQUESTS; i++) {
-        if (requests[i].in_use && requests[i].ready_for_cleanup) {
+        if (request_can_cleanup(&requests[i])) {
             request_free(&requests[i]);
         }
     }
@@ -559,7 +556,6 @@ static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
     if (p == NULL) {
         if (req) {
             request_close_connection(req);
-            request_free(req);
         }
         return ERR_OK;
     }
@@ -585,7 +581,7 @@ static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
             req->state = REQUEST_STATE_PARSING;
             parse_http_request(req);
 
-            if (req->state == REQUEST_STATE_OPENING_FILE && !req->connection_closed && !req->fs_operation_in_flight && fs_queue_length_producer(fs_command_queue) < FS_QUEUE_CAPACITY) {
+            if (req->state == REQUEST_STATE_OPENING_FILE && FS_OP_SAFE(req)) {
                 req->path_buffer = fs_buffer_allocate();
                 req->read_buffer = fs_buffer_allocate();
 
@@ -599,9 +595,7 @@ static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
                                  .id = req->fs_request_id,
                                  .params.file_open = { .path = { .offset = req->path_buffer, .size = path_len },
                                                        .flags = FS_OPEN_FLAGS_READ_ONLY } };
-                fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd;
-                fs_queue_publish_production(fs_command_queue, 1);
-                microkit_notify(fs_config.server.id);
+                SUBMIT_FS_CMD(cmd);
             } else if (req->state == REQUEST_STATE_OPENING_FILE) {
                 request_close_connection(req);
             }
@@ -732,9 +726,7 @@ void init(void)
     }
 
     fs_cmd_t cmd = { .type = FS_CMD_INITIALISE, .id = 0 };
-    fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd;
-    fs_queue_publish_production(fs_command_queue, 1);
-    microkit_notify(fs_config.server.id);
+    SUBMIT_FS_CMD(cmd);
 }
 
 void notified(microkit_channel ch)
@@ -764,33 +756,12 @@ void notified(microkit_channel ch)
 /* fs buffer management */
 ptrdiff_t fs_buffer_allocate(void)
 {
-    int start = fs_buffer_next_hint;
-    
-    for (int i = 0; i < FS_BUFFER_COUNT; i++) {
-        int idx = (start + i) % FS_BUFFER_COUNT;
-        int word_idx = idx / 64;
-        int bit_idx = idx % 64;
-        uint64_t mask = 1ULL << bit_idx;
-        
-        if (!(fs_buffer_bitmap[word_idx] & mask)) {
-            fs_buffer_bitmap[word_idx] |= mask;
-            fs_buffer_next_hint = (idx + 1) % FS_BUFFER_COUNT;
-
-            return idx * FILE_READ_BUFFER_SIZE;
-        }
-    }
-    return -1;
+    int idx = bitmap_alloc(fs_buffer_bitmap, FS_BUFFER_COUNT, &fs_buffer_next_hint);
+    return idx == -1 ? -1 : idx * FILE_READ_BUFFER_SIZE;
 }
 
 void fs_buffer_free(ptrdiff_t buffer)
 {
     int idx = buffer / FILE_READ_BUFFER_SIZE;
-    if (idx >= 0 && idx < FS_BUFFER_COUNT) {
-        int word_idx = idx / 64;
-        int bit_idx = idx % 64;
-        uint64_t mask = 1ULL << bit_idx;
-        
-        fs_buffer_bitmap[word_idx] &= ~mask;
-        fs_buffer_next_hint = idx;
-    }
+    bitmap_free(fs_buffer_bitmap, idx, FS_BUFFER_COUNT, &fs_buffer_next_hint);
 }
