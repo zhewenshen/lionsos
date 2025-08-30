@@ -15,7 +15,7 @@
 
 #define LWIP_TICK_MS 100
 #define HTTP_PORT 80
-#define MAX_CONCURRENT_REQUESTS 16
+#define MAX_CONCURRENT_REQUESTS 128
 #define FILE_READ_BUFFER_SIZE 0x8000
 #define MAX_PATH_LENGTH 4096
 #define MAX_RESPONSE_HEADER_SIZE 512
@@ -62,6 +62,12 @@ typedef struct http_request {
     bool file_open;
     bool in_use;
     bool is_head_request;
+    
+    // Async operation tracking
+    int outstanding_operations;
+    bool connection_closed;
+    bool ready_for_cleanup;
+    bool fs_operation_in_flight;
 
     char header_buffer[512];
     size_t header_len;
