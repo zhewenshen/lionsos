@@ -60,10 +60,9 @@ static bool net_enabled = false;
 static http_request_t requests[MAX_CONCURRENT_REQUESTS];
 static bool fs_initialized = false;
 
-static uint64_t request_id_counter = 1;
-static bool request_id_allocator_initialized = false;
+static uint64_t id_counter = 1;
 
-static uint64_t request_bitmap[2] = {0};
+static uint64_t request_bitmap[2] = { 0 };
 static int request_next_hint = 0;
 
 #define FS_BUFFER_COUNT (FS_QUEUE_CAPACITY * 2)
@@ -101,7 +100,7 @@ static int bitmap_alloc(uint64_t *bitmap, int max_count, int *hint)
     for (int i = 0; i < max_count; i++) {
         int idx = (start + i) % max_count;
         uint64_t mask = BITMAP_MASK(idx);
-        
+
         if (!(bitmap[BITMAP_WORD(idx)] & mask)) {
             bitmap[BITMAP_WORD(idx)] |= mask;
             *hint = (idx + 1) % max_count;
@@ -133,9 +132,7 @@ static void send_file_read_command(http_request_t *req, uint64_t offset, size_t 
     fs_cmd_t cmd = { .type = FS_CMD_FILE_READ,
                      .id = req->fs_request_id,
                      .params.file_read = {
-                         .fd = req->file_fd,
-                         .offset = offset,
-                         .buf = { .offset = req->read_buffer, .size = size } } };
+                         .fd = req->file_fd, .offset = offset, .buf = { .offset = req->read_buffer, .size = size } } };
     SUBMIT_FS_CMD(cmd);
 }
 
@@ -147,25 +144,13 @@ static void finish_response_and_close(http_request_t *req)
     request_close_connection(req);
 }
 
-/* TODO: fix id allocate */
-static void request_id_allocator_init(void)
-{
-    request_id_allocator_initialized = true;
-}
-
 static uint64_t request_id_alloc(void)
 {
-    if (!request_id_allocator_initialized) {
-        request_id_allocator_init();
-    }
-
-    return request_id_counter++;
+    uint64_t id = id_counter++;
+    if (id == 0) id = id_counter++;  /* skip 0 after wrap */
+    return id;
 }
 
-static void request_id_free(uint64_t id)
-{
-    (void)id;
-}
 
 static void request_start_operation(http_request_t *req)
 {
@@ -237,8 +222,9 @@ static const char *content_type_from_extension(const char *path)
 static http_request_t *request_alloc(void)
 {
     int idx = bitmap_alloc(request_bitmap, MAX_CONCURRENT_REQUESTS, &request_next_hint);
-    if (idx == -1) return NULL;
-    
+    if (idx == -1)
+        return NULL;
+
     memset(&requests[idx], 0, sizeof(http_request_t));
     requests[idx].in_use = true;
     requests[idx].file_fd = UINT64_MAX;
@@ -252,13 +238,13 @@ static void request_close_connection(http_request_t *req)
 {
     if (!req || !req->in_use)
         return;
-        
+
     if (req->pcb) {
         tcp_cleanup_callbacks(req->pcb);
         tcp_close(req->pcb);
         req->pcb = NULL;
     }
-    
+
     req->connection_closed = true;
 }
 
@@ -276,8 +262,7 @@ static void request_free(http_request_t *req)
 
     int idx = req - requests;
     bitmap_free(request_bitmap, idx, MAX_CONCURRENT_REQUESTS, &request_next_hint);
-    
-    request_id_free(req->fs_request_id);
+
     req->in_use = false;
 }
 
@@ -343,7 +328,6 @@ static void send_http_error(struct tcp_pcb *pcb, int code, const char *status)
     tcp_output(pcb);
 }
 
-
 static void parse_http_request(http_request_t *req)
 {
     const char *method, *path;
@@ -371,12 +355,12 @@ static void parse_http_request(http_request_t *req)
 
     bool is_get = (method_len == 3 && memcmp(method, "GET", 3) == 0);
     bool is_head = (method_len == 4 && memcmp(method, "HEAD", 4) == 0);
-    
+
     if (!is_get && !is_head) {
         HTTP_ERROR_AND_CLOSE(req, 501, "Not Implemented");
         return;
     }
-    
+
     req->is_head_request = is_head;
 
     const char *query = memchr(path, '?', path_len);
@@ -444,11 +428,11 @@ static void process_file_operations(void)
         }
 
         request_complete_operation(req);
-        
+
         if (!req->in_use) {
             continue;
         }
-        
+
         if (req->connection_closed) {
             request_cleanup_if_ready(req);
             continue;
@@ -498,7 +482,7 @@ static void process_file_operations(void)
                     if (header_len > 0) {
                         tcp_write(req->pcb, req->response_headers, header_len, TCP_WRITE_FLAG_MORE);
                         req->headers_sent = true;
-                        
+
                         if (req->is_head_request) {
                             finish_response_and_close(req);
                             break;
@@ -525,7 +509,7 @@ static void process_file_operations(void)
             }
             break;
         }
-        
+
         default:
             request_close_connection(req);
             break;
@@ -533,7 +517,7 @@ static void process_file_operations(void)
     }
 
     fs_queue_publish_consumption(fs_completion_queue, to_consume);
-    
+
     for (int i = 0; i < MAX_CONCURRENT_REQUESTS; i++) {
         if (request_can_cleanup(&requests[i])) {
             request_free(&requests[i]);
@@ -613,7 +597,7 @@ static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     if (!newpcb) {
         return ERR_ABRT;
     }
-    
+
     http_request_t *req = request_alloc();
     if (!req) {
         tcp_close(newpcb);
@@ -658,7 +642,6 @@ static err_t http_poll(void *arg, struct tcp_pcb *pcb)
     return ERR_OK;
 }
 
-
 static void setup_http_server(void)
 {
     struct tcp_pcb *pcb = tcp_new();
@@ -698,14 +681,13 @@ static void init_networking(void)
                    net_config.tx.num_buffers);
     net_buffers_init(&net_tx_queue, 0);
 
-    sddf_lwip_init(&lib_sddf_lwip_config, &net_config, &timer_config, net_rx_queue, net_tx_queue, NULL,
-                   NULL, netif_status_callback, NULL, NULL, NULL);
-    
+    sddf_lwip_init(&lib_sddf_lwip_config, &net_config, &timer_config, net_rx_queue, net_tx_queue, NULL, NULL,
+                   netif_status_callback, NULL, NULL, NULL);
+
     sddf_timer_set_timeout(timer_config.driver_id, 100 * NS_IN_MS);
-    
+
     sddf_lwip_maybe_notify();
 }
-
 
 void init(void)
 {

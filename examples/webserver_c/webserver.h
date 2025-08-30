@@ -62,7 +62,7 @@ typedef struct http_request {
     bool file_open;
     bool in_use;
     bool is_head_request;
-    
+
     int outstanding_operations;
     bool connection_closed;
     bool fs_operation_in_flight;
@@ -70,7 +70,7 @@ typedef struct http_request {
     char header_buffer[512];
     size_t header_len;
     size_t header_parsed;
-    
+
     char response_headers[MAX_RESPONSE_HEADER_SIZE];
     char full_path[MAX_PATH_LENGTH];
 } http_request_t;
