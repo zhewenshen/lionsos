@@ -4,6 +4,9 @@
  */
 
 #include "utils.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
 
 typedef enum { STATE_NORMAL = 0, STATE_AFTER_SLASH = 1 } parse_state_t;
 
@@ -127,4 +130,100 @@ done:
 
     *dst = '\0';
     return dst - path;
+}
+
+#define SECONDS_1970_TO_2000 946684800ULL
+
+static inline int is_leap_year(int year)
+{
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+static void seconds_to_struct_time(uint64_t seconds, int *year, int *month, int *day, int *hour, int *minute,
+                                   int *second, int *weekday)
+{
+    static const int days_in_month[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+    *second = seconds % 60;
+    seconds /= 60;
+    *minute = seconds % 60;
+    seconds /= 60;
+    *hour = seconds % 24;
+    seconds /= 24;
+
+    *weekday = (seconds + 6) % 7;
+
+    *year = 2000;
+    while (true) {
+        int days_this_year = is_leap_year(*year) ? 366 : 365;
+        if (seconds < days_this_year)
+            break;
+        seconds -= days_this_year;
+        (*year)++;
+    }
+
+    *month = 1;
+    while (true) {
+        int days_this_month = days_in_month[*month - 1];
+        if (*month == 2 && is_leap_year(*year))
+            days_this_month = 29;
+        if (seconds < days_this_month)
+            break;
+        seconds -= days_this_month;
+        (*month)++;
+    }
+
+    *day = seconds + 1;
+}
+
+void format_http_date_from_unix(char *buffer, size_t buffer_size, uint64_t unix_timestamp)
+{
+    const char *days[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const char *months[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    uint64_t seconds_since_2000 = unix_timestamp - SECONDS_1970_TO_2000;
+
+    int year, month, day, hour, minute, second, weekday;
+    seconds_to_struct_time(seconds_since_2000, &year, &month, &day, &hour, &minute, &second, &weekday);
+
+    snprintf(buffer, buffer_size, "%s, %02d %s %04d %02d:%02d:%02d GMT", days[weekday], day, months[month - 1], year,
+             hour, minute, second);
+}
+
+uint64_t parse_http_date(const char *date_str)
+{
+    static const char *months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+
+    char day_name[4], month_name[4];
+    int day, year, hour, minute, second;
+
+    if (sscanf(date_str, "%3s, %d %3s %d %d:%d:%d", day_name, &day, month_name, &year, &hour, &minute, &second) != 7) {
+        return 0;
+    }
+
+    int month = 1;
+    for (int i = 0; i < 12; i++) {
+        if (strncmp(month_name, months[i], 3) == 0) {
+            month = i + 1;
+            break;
+        }
+    }
+
+    uint64_t seconds_since_2000 = 0;
+    for (int y = 2000; y < year; y++) {
+        seconds_since_2000 += is_leap_year(y) ? 366 * 86400ULL : 365 * 86400ULL;
+    }
+
+    static const int days_in_month[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    for (int m = 1; m < month; m++) {
+        int days = days_in_month[m - 1];
+        if (m == 2 && is_leap_year(year))
+            days = 29;
+        seconds_since_2000 += days * 86400ULL;
+    }
+
+    seconds_since_2000 += (day - 1) * 86400ULL + hour * 3600ULL + minute * 60ULL + second;
+    return seconds_since_2000 + SECONDS_1970_TO_2000;
 }

@@ -147,10 +147,10 @@ static void finish_response_and_close(http_request_t *req)
 static uint64_t request_id_alloc(void)
 {
     uint64_t id = id_counter++;
-    if (id == 0) id = id_counter++;  /* skip 0 after wrap */
+    if (id == 0)
+        id = id_counter++;  /* skip 0 after wrap */
     return id;
 }
-
 
 static void request_start_operation(http_request_t *req)
 {
@@ -273,49 +273,47 @@ static void request_cleanup_if_ready(http_request_t *req)
     }
 }
 
-static int build_http_headers(char *buffer, size_t buffer_size, const char *content_type, uint64_t content_length)
+
+static int build_http_headers(char *buffer, size_t buffer_size, const char *content_type, uint64_t content_length,
+                              uint64_t mtime)
 {
-    char *pos = buffer;
-    const char *end = buffer + buffer_size - 1;
+    char last_modified_buffer[64];
+    format_http_date_from_unix(last_modified_buffer, sizeof(last_modified_buffer), mtime);
 
-    const size_t prefix_len = sizeof(HTTP_HEADER_PREFIX) - 1;
-    if (pos + prefix_len > end)
+    int len = snprintf(buffer, buffer_size,
+                       "HTTP/1.0 200 OK\r\n"
+                       "Allow: GET, HEAD\r\n"
+                       "Content-Type: %s\r\n"
+                       "Content-Length: %lu\r\n"
+                       "Last-Modified: %s\r\n"
+                       "Cache-Control: max-age=600\r\n"
+                       "Connection: close\r\n"
+                       "\r\n",
+                       content_type, content_length, last_modified_buffer);
+
+    if (len < 0 || len >= buffer_size)
         return -1;
-    memcpy(pos, HTTP_HEADER_PREFIX, prefix_len);
-    pos += prefix_len;
 
-    size_t ct_len = strlen(content_type);
-    if (pos + ct_len > end)
-        return -1;
-    memcpy(pos, content_type, ct_len);
-    pos += ct_len;
-
-    const size_t suffix_len = sizeof(HTTP_HEADER_SUFFIX) - 1;
-    if (pos + suffix_len > end)
-        return -1;
-    memcpy(pos, HTTP_HEADER_SUFFIX, suffix_len);
-    pos += suffix_len;
-
-    char length_str[32];
-    int length_digits = snprintf(length_str, sizeof(length_str), "%lu", content_length);
-    if (pos + length_digits > end)
-        return -1;
-    memcpy(pos, length_str, length_digits);
-    pos += length_digits;
-
-    const size_t end_len = sizeof(HTTP_HEADER_END) - 1;
-    if (pos + end_len > end)
-        return -1;
-    memcpy(pos, HTTP_HEADER_END, end_len);
-    pos += end_len;
-
-    return pos - buffer;
+    return len;
 }
 
 static void send_http_error(struct tcp_pcb *pcb, int code, const char *status)
 {
     static char response[256];
-    int len = snprintf(response, sizeof(response),
+    int len;
+
+    if (code == 405) {
+        len = snprintf(response, sizeof(response),
+                       "HTTP/1.0 405 Method Not Allowed\r\n"
+                       "Allow: GET, HEAD\r\n"
+                       "Content-Type: text/plain\r\n"
+                       "Content-Length: %d\r\n"
+                       "Connection: close\r\n"
+                       "\r\n"
+                       "405 Method Not Allowed\n",
+                       strlen("405 Method Not Allowed") + 1);
+    } else {
+        len = snprintf(response, sizeof(response),
                        "HTTP/1.0 %d %s\r\n"
                        "Content-Type: text/plain\r\n"
                        "Content-Length: %d\r\n"
@@ -323,6 +321,7 @@ static void send_http_error(struct tcp_pcb *pcb, int code, const char *status)
                        "\r\n"
                        "%d %s\n",
                        code, status, strlen(status) + 5, code, status);
+    }
 
     tcp_write(pcb, response, len, TCP_WRITE_FLAG_MORE);
     tcp_output(pcb);
@@ -355,6 +354,13 @@ static void parse_http_request(http_request_t *req)
 
     bool is_get = (method_len == 3 && memcmp(method, "GET", 3) == 0);
     bool is_head = (method_len == 4 && memcmp(method, "HEAD", 4) == 0);
+    bool is_post = (method_len == 4 && memcmp(method, "POST", 4) == 0);
+
+    if (is_post) {
+        /* POST is not allowed */
+        HTTP_ERROR_AND_CLOSE(req, 405, "Method Not Allowed");
+        return;
+    }
 
     if (!is_get && !is_head) {
         HTTP_ERROR_AND_CLOSE(req, 501, "Not Implemented");
@@ -362,6 +368,18 @@ static void parse_http_request(http_request_t *req)
     }
 
     req->is_head_request = is_head;
+    req->if_modified_since = 0;
+
+    for (size_t i = 0; i < num_headers; i++) {
+        if (headers[i].name_len == 17 && strncasecmp(headers[i].name, "If-Modified-Since", 17) == 0) {
+            char date_buffer[128];
+            size_t date_len = MIN(headers[i].value_len, sizeof(date_buffer) - 1);
+            memcpy(date_buffer, headers[i].value, date_len);
+            date_buffer[date_len] = '\0';
+            req->if_modified_since = parse_http_date(date_buffer);
+            break;
+        }
+    }
 
     const char *query = memchr(path, '?', path_len);
     size_t actual_path_len = query ? (size_t)(query - path) : path_len;
@@ -395,7 +413,7 @@ static void parse_http_request(http_request_t *req)
 
     snprintf(req->version, sizeof(req->version), "1.%d", minor_version);
 
-    req->state = REQUEST_STATE_OPENING_FILE;
+    req->state = REQUEST_STATE_STAT_FILE;
 }
 
 static void process_file_operations(void)
@@ -439,18 +457,32 @@ static void process_file_operations(void)
         }
 
         switch (req->state) {
-        case REQUEST_STATE_OPENING_FILE: {
+        case REQUEST_STATE_STAT_FILE: {
             if (completion.status == FS_STATUS_SUCCESS) {
-                req->file_fd = completion.data.file_open.fd;
-                req->file_open = true;
+                fs_stat_t *stat = (fs_stat_t *)(fs_share + req->stat_buffer);
+                req->file_size = stat->size;
+                req->file_mtime = stat->mtime;
 
-                if (FS_OP_SAFE(req)) {
+                if (req->if_modified_since > 0 && req->file_mtime <= req->if_modified_since && req->pcb) {
+                    static char response[256];
+                    int len = snprintf(response, sizeof(response),
+                                       "HTTP/1.0 304 Not Modified\r\n"
+                                       "Cache-Control: max-age=3600\r\n"
+                                       "Connection: close\r\n"
+                                       "\r\n");
+
+                    tcp_write(req->pcb, response, len, TCP_WRITE_FLAG_MORE);
+                    tcp_output(req->pcb);
+                    request_close_connection(req);
+                } else if (FS_OP_SAFE(req)) {
                     request_start_operation(req);
-                    fs_cmd_t cmd = { .type = FS_CMD_FILE_SIZE,
+                    fs_cmd_t cmd = { .type = FS_CMD_FILE_OPEN,
                                      .id = req->fs_request_id,
-                                     .params.file_size.fd = req->file_fd };
+                                     .params.file_open = {
+                                         .path = { .offset = req->path_buffer, .size = strlen(req->full_path) },
+                                         .flags = FS_OPEN_FLAGS_READ_ONLY } };
                     SUBMIT_FS_CMD(cmd);
-                    req->state = REQUEST_STATE_READING_FILE;
+                    req->state = REQUEST_STATE_OPENING_FILE;
                 } else {
                     request_close_connection(req);
                 }
@@ -460,24 +492,32 @@ static void process_file_operations(void)
             break;
         }
 
+        case REQUEST_STATE_OPENING_FILE: {
+            if (completion.status == FS_STATUS_SUCCESS) {
+                req->file_fd = completion.data.file_open.fd;
+                req->file_open = true;
+
+                if (FS_OP_SAFE(req)) {
+                    send_file_read_command(req, 0, MIN(FILE_READ_BUFFER_SIZE, req->file_size));
+                    req->state = REQUEST_STATE_READING_FILE;
+                } else {
+                    request_close_connection(req);
+                }
+            } else {
+                HTTP_ERROR_AND_CLOSE(req, 500, "Internal Server Error");
+            }
+            break;
+        }
+
         case REQUEST_STATE_READING_FILE: {
             if (completion.status == FS_STATUS_SUCCESS) {
-                if (req->file_size == 0) {
-                    req->file_size = completion.data.file_size.size;
-
-                    if (FS_OP_SAFE(req)) {
-                        send_file_read_command(req, 0, MIN(FILE_READ_BUFFER_SIZE, req->file_size));
-                    } else {
-                        request_close_connection(req);
-                    }
-                    break;
-                }
 
                 size_t bytes_read = completion.data.file_read.len_read;
 
                 if (!req->headers_sent && req->pcb) {
                     int header_len = build_http_headers(req->response_headers, sizeof(req->response_headers),
-                                                        content_type_from_extension(req->path), req->file_size);
+                                                        content_type_from_extension(req->path), req->file_size,
+                                                        req->file_mtime);
 
                     if (header_len > 0) {
                         tcp_write(req->pcb, req->response_headers, header_len, TCP_WRITE_FLAG_MORE);
@@ -565,22 +605,28 @@ static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
             req->state = REQUEST_STATE_PARSING;
             parse_http_request(req);
 
-            if (req->state == REQUEST_STATE_OPENING_FILE && FS_OP_SAFE(req)) {
+            if (req->state == REQUEST_STATE_STAT_FILE && FS_OP_SAFE(req)) {
                 req->path_buffer = fs_buffer_allocate();
                 req->read_buffer = fs_buffer_allocate();
+                req->stat_buffer = fs_buffer_allocate();
 
-                snprintf(req->full_path, sizeof(req->full_path), "%s%s", WEB_ROOT_DIR, req->path);
+                if (req->path_buffer == -1 || req->read_buffer == -1 || req->stat_buffer == -1) {
+                    request_close_connection(req);
+                } else {
+                    snprintf(req->full_path, sizeof(req->full_path), "%s%s", WEB_ROOT_DIR, req->path);
 
-                size_t path_len = strlen(req->full_path);
-                memcpy(fs_share + req->path_buffer, req->full_path, path_len + 1);
+                    size_t path_len = strlen(req->full_path);
+                    memcpy(fs_share + req->path_buffer, req->full_path, path_len + 1);
 
-                request_start_operation(req);
-                fs_cmd_t cmd = { .type = FS_CMD_FILE_OPEN,
-                                 .id = req->fs_request_id,
-                                 .params.file_open = { .path = { .offset = req->path_buffer, .size = path_len },
-                                                       .flags = FS_OPEN_FLAGS_READ_ONLY } };
-                SUBMIT_FS_CMD(cmd);
-            } else if (req->state == REQUEST_STATE_OPENING_FILE) {
+                    request_start_operation(req);
+                    fs_cmd_t cmd = { .type = FS_CMD_STAT,
+                                     .id = req->fs_request_id,
+                                     .params.stat = {
+                                         .path = { .offset = req->path_buffer, .size = path_len },
+                                         .buf = { .offset = req->stat_buffer, .size = sizeof(fs_stat_t) } } };
+                    SUBMIT_FS_CMD(cmd);
+                }
+            } else if (req->state == REQUEST_STATE_STAT_FILE) {
                 request_close_connection(req);
             }
         }
