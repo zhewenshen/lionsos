@@ -68,22 +68,26 @@ static int request_next_hint = 0;
 #define FS_BUFFER_COUNT (FS_QUEUE_CAPACITY * 2)
 #define FS_BITMAP_WORDS ((FS_BUFFER_COUNT + 63) / 64)
 
-#define FS_OP_SAFE(req) (!req->connection_closed && !req->fs_operation_in_flight)
+#define FS_OP_SAFE(req)                                                        \
+  (!req->connection_closed && !req->fs_operation_in_flight)
 
-#define HTTP_ERROR_AND_CLOSE(req, code, msg) do { \
-    if (req->pcb) send_http_error(req->pcb, code, msg); \
-    request_close_connection(req); \
-} while(0)
+#define HTTP_ERROR_AND_CLOSE(req, code, msg)                                   \
+  do {                                                                         \
+    if (req->pcb)                                                              \
+      send_http_error(req->pcb, code, msg);                                    \
+    request_close_connection(req);                                             \
+  } while (0)
 
 #define BITMAP_WORD(idx) ((idx) / 64)
 #define BITMAP_BIT(idx) ((idx) % 64)
 #define BITMAP_MASK(idx) (1ULL << BITMAP_BIT(idx))
 
-#define SUBMIT_FS_CMD(cmd) do { \
-    fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd; \
-    fs_queue_publish_production(fs_command_queue, 1); \
-    microkit_notify(fs_config.server.id); \
-} while(0)
+#define SUBMIT_FS_CMD(cmd)                                                     \
+  do {                                                                         \
+    fs_queue_idx_empty(fs_command_queue, 0)->cmd = cmd;                        \
+    fs_queue_publish_production(fs_command_queue, 1);                          \
+    microkit_notify(fs_config.server.id);                                      \
+  } while (0)
 
 static uint64_t fs_buffer_bitmap[FS_BITMAP_WORDS];
 static int fs_buffer_next_hint = 0;
@@ -148,7 +152,7 @@ static uint64_t request_id_alloc(void)
 {
     uint64_t id = id_counter++;
     if (id == 0)
-        id = id_counter++;  /* skip 0 after wrap */
+        id = id_counter++; /* skip 0 after wrap */
     return id;
 }
 
@@ -273,6 +277,14 @@ static void request_cleanup_if_ready(http_request_t *req)
     }
 }
 
+static const char *get_cache_control(const char *content_type)
+{
+    if (strcmp(content_type, "text/html") == 0 || strcmp(content_type, "text/css") == 0
+        || strcmp(content_type, "application/javascript") == 0) {
+        return "max-age=600";
+    }
+    return "max-age=31536000";
+}
 
 static int build_http_headers(char *buffer, size_t buffer_size, const char *content_type, uint64_t content_length,
                               uint64_t mtime)
@@ -280,16 +292,18 @@ static int build_http_headers(char *buffer, size_t buffer_size, const char *cont
     char last_modified_buffer[64];
     format_http_date_from_unix(last_modified_buffer, sizeof(last_modified_buffer), mtime);
 
+    const char *cache_control = get_cache_control(content_type);
+
     int len = snprintf(buffer, buffer_size,
                        "HTTP/1.0 200 OK\r\n"
                        "Allow: GET, HEAD\r\n"
                        "Content-Type: %s\r\n"
                        "Content-Length: %lu\r\n"
                        "Last-Modified: %s\r\n"
-                       "Cache-Control: max-age=600\r\n"
+                       "Cache-Control: %s\r\n"
                        "Connection: close\r\n"
                        "\r\n",
-                       content_type, content_length, last_modified_buffer);
+                       content_type, content_length, last_modified_buffer, cache_control);
 
     if (len < 0 || len >= buffer_size)
         return -1;
@@ -663,7 +677,7 @@ static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
         return ERR_MEM;
     }
 
-    /* tcp_nodelay for lower latency */
+  /* tcp_nodelay for lower latency */
     tcp_nagle_disable(newpcb);
 
     tcp_arg(newpcb, req);
@@ -698,7 +712,7 @@ static void setup_http_server(void)
 
     err_t err = tcp_bind(pcb, IP_ADDR_ANY, 80);
     if (err != ERR_OK) {
-        // sddf_dprintf("Failed to bind TCP PCB: %d\n", err);
+    // sddf_dprintf("Failed to bind TCP PCB: %d\n", err);
         tcp_close(pcb);
         return;
     }
@@ -762,7 +776,7 @@ void notified(microkit_channel ch)
     if (net_enabled && ch == net_config.rx.id) {
         sddf_lwip_process_rx();
     } else if (net_enabled && ch == net_config.tx.id) {
-        /* handled by lib_sddf_lwip */
+    /* handled by lib_sddf_lwip */
     } else if (ch == timer_config.driver_id) {
         if (net_enabled) {
             sddf_lwip_process_timeout();
