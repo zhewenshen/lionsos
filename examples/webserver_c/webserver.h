@@ -20,6 +20,9 @@
 #define MAX_PATH_LENGTH 4096
 #define MAX_RESPONSE_HEADER_SIZE 512
 
+#define KEEPALIVE_TIMEOUT_MS 5000
+#define KEEPALIVE_MAX_REQUESTS 256
+
 #define LINK_SPEED 1000000000
 #define ETHER_MTU 1500
 
@@ -35,10 +38,21 @@ typedef enum {
     REQUEST_STATE_CLOSING
 } request_state_t;
 
-/* http request structure */
-typedef struct http_request {
+typedef struct http_connection {
     struct tcp_pcb *pcb;
+    bool keep_alive;
+    int requests_served;
+    uint64_t last_activity_time;
+    bool in_use;
+    struct http_request *current_request;
+    
+    char header_buffer[512];
+    size_t header_len;
+} http_connection_t;
+
+typedef struct http_request {
     request_state_t state;
+    http_connection_t *connection;
 
     char method[16];
     char path[MAX_PATH_LENGTH];
@@ -57,16 +71,10 @@ typedef struct http_request {
 
     bool headers_sent;
     bool file_open;
-    bool in_use;
     bool is_head_request;
 
     int outstanding_operations;
-    bool connection_closed;
     bool fs_operation_in_flight;
-
-    char header_buffer[512];
-    size_t header_len;
-    size_t header_parsed;
 
     char response_headers[MAX_RESPONSE_HEADER_SIZE];
     char full_path[MAX_PATH_LENGTH];
