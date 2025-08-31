@@ -102,7 +102,8 @@ static const char *token_char_map = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\
                                     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
                                     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
-static const char *findchar_fast(const char *buf, const char *buf_end, const char *ranges, size_t ranges_size, int *found)
+static const char *findchar_fast(const char *buf, const char *buf_end, const char *ranges, size_t ranges_size,
+                                 int *found)
 {
     *found = 0;
 #if __SSE4_2__
@@ -112,7 +113,8 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
         size_t left = (buf_end - buf) & ~15;
         do {
             __m128i b16 = _mm_loadu_si128((const __m128i *)buf);
-            int r = _mm_cmpestri(ranges16, ranges_size, b16, 16, _SIDD_LEAST_SIGNIFICANT | _SIDD_CMP_RANGES | _SIDD_UBYTE_OPS);
+            int r = _mm_cmpestri(ranges16, ranges_size, b16, 16,
+                                 _SIDD_LEAST_SIGNIFICANT | _SIDD_CMP_RANGES | _SIDD_UBYTE_OPS);
             if (unlikely(r != 16)) {
                 buf += r;
                 *found = 1;
@@ -131,7 +133,8 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
     return buf;
 }
 
-static const char *get_token_to_eol(const char *buf, const char *buf_end, const char **token, size_t *token_len, int *ret)
+static const char *get_token_to_eol(const char *buf, const char *buf_end, const char **token, size_t *token_len,
+                                    int *ret)
 {
     const char *token_start = buf;
 
@@ -242,18 +245,18 @@ static const char *is_complete(const char *buf, const char *buf_end, size_t last
     } while (0)
 
 /* returned pointer is always within [buf, buf_end), or null */
-static const char *parse_token(const char *buf, const char *buf_end, const char **token, size_t *token_len, char next_char,
-                               int *ret)
+static const char *parse_token(const char *buf, const char *buf_end, const char **token, size_t *token_len,
+                               char next_char, int *ret)
 {
     /* We use pcmpestri to detect non-token characters. This instruction can take no more than eight character ranges (8*2*8=128
      * bits that is the size of a SSE register). Due to this restriction, characters `|` and `~` are handled in the slow loop. */
-    static const char ALIGNED(16) ranges[] = "\x00 "  /* control chars and up to SP */
-                                             "\"\""   /* 0x22 */
-                                             "()"     /* 0x28,0x29 */
-                                             ",,"     /* 0x2c */
-                                             "//"     /* 0x2f */
-                                             ":@"     /* 0x3a-0x40 */
-                                             "[]"     /* 0x5b-0x5d */
+    static const char ALIGNED(16) ranges[] = "\x00 " /* control chars and up to SP */
+                                             "\"\"" /* 0x22 */
+                                             "()" /* 0x28,0x29 */
+                                             ",," /* 0x2c */
+                                             "//" /* 0x2f */
+                                             ":@" /* 0x3a-0x40 */
+                                             "[]" /* 0x5b-0x5d */
                                              "{\xff"; /* 0x7b-0xff */
     const char *buf_start = buf;
     int found;
@@ -315,7 +318,9 @@ static const char *parse_headers(const char *buf, const char *buf_end, struct ph
         if (!(*num_headers != 0 && (*buf == ' ' || *buf == '\t'))) {
             /* parsing name, but do not discard SP before colon, see
              * http://www.mozilla.org/security/announce/2006/mfsa2006-33.html */
-            if ((buf = parse_token(buf, buf_end, &headers[*num_headers].name, &headers[*num_headers].name_len, ':', ret)) == NULL) {
+            if ((buf = parse_token(buf, buf_end, &headers[*num_headers].name, &headers[*num_headers].name_len, ':',
+                                   ret))
+                == NULL) {
                 return NULL;
             }
             if (headers[*num_headers].name_len == 0) {
@@ -352,9 +357,9 @@ static const char *parse_headers(const char *buf, const char *buf_end, struct ph
     return buf;
 }
 
-static const char *parse_request(const char *buf, const char *buf_end, const char **method, size_t *method_len, const char **path,
-                                 size_t *path_len, int *minor_version, struct phr_header *headers, size_t *num_headers,
-                                 size_t max_headers, int *ret)
+static const char *parse_request(const char *buf, const char *buf_end, const char **method, size_t *method_len,
+                                 const char **path, size_t *path_len, int *minor_version, struct phr_header *headers,
+                                 size_t *num_headers, size_t max_headers, int *ret)
 {
     /* skip first empty line (some clients add CRLF after POST content) */
     CHECK_EOF();
@@ -399,7 +404,8 @@ static const char *parse_request(const char *buf, const char *buf_end, const cha
 }
 
 int phr_parse_request(const char *buf_start, size_t len, const char **method, size_t *method_len, const char **path,
-                      size_t *path_len, int *minor_version, struct phr_header *headers, size_t *num_headers, size_t last_len)
+                      size_t *path_len, int *minor_version, struct phr_header *headers, size_t *num_headers,
+                      size_t last_len)
 {
     const char *buf = buf_start, *buf_end = buf_start + len;
     size_t max_headers = *num_headers;
@@ -418,16 +424,18 @@ int phr_parse_request(const char *buf_start, size_t len, const char **method, si
         return r;
     }
 
-    if ((buf = parse_request(buf, buf_end, method, method_len, path, path_len, minor_version, headers, num_headers, max_headers,
-                             &r)) == NULL) {
+    if ((buf = parse_request(buf, buf_end, method, method_len, path, path_len, minor_version, headers, num_headers,
+                             max_headers, &r))
+        == NULL) {
         return r;
     }
 
     return (int)(buf - buf_start);
 }
 
-static const char *parse_response(const char *buf, const char *buf_end, int *minor_version, int *status, const char **msg,
-                                  size_t *msg_len, struct phr_header *headers, size_t *num_headers, size_t max_headers, int *ret)
+static const char *parse_response(const char *buf, const char *buf_end, int *minor_version, int *status,
+                                  const char **msg, size_t *msg_len, struct phr_header *headers, size_t *num_headers,
+                                  size_t max_headers, int *ret)
 {
     /* parse "HTTP/1.x" */
     if ((buf = parse_http_version(buf, buf_end, minor_version, ret)) == NULL) {
@@ -471,8 +479,8 @@ static const char *parse_response(const char *buf, const char *buf_end, int *min
     return parse_headers(buf, buf_end, headers, num_headers, max_headers, ret);
 }
 
-int phr_parse_response(const char *buf_start, size_t len, int *minor_version, int *status, const char **msg, size_t *msg_len,
-                       struct phr_header *headers, size_t *num_headers, size_t last_len)
+int phr_parse_response(const char *buf_start, size_t len, int *minor_version, int *status, const char **msg,
+                       size_t *msg_len, struct phr_header *headers, size_t *num_headers, size_t last_len)
 {
     const char *buf = buf_start, *buf_end = buf + len;
     size_t max_headers = *num_headers;
@@ -490,14 +498,16 @@ int phr_parse_response(const char *buf_start, size_t len, int *minor_version, in
         return r;
     }
 
-    if ((buf = parse_response(buf, buf_end, minor_version, status, msg, msg_len, headers, num_headers, max_headers, &r)) == NULL) {
+    if ((buf = parse_response(buf, buf_end, minor_version, status, msg, msg_len, headers, num_headers, max_headers, &r))
+        == NULL) {
         return r;
     }
 
     return (int)(buf - buf_start);
 }
 
-int phr_parse_headers(const char *buf_start, size_t len, struct phr_header *headers, size_t *num_headers, size_t last_len)
+int phr_parse_headers(const char *buf_start, size_t len, struct phr_header *headers, size_t *num_headers,
+                      size_t last_len)
 {
     const char *buf = buf_start, *buf_end = buf + len;
     size_t max_headers = *num_headers;
@@ -691,7 +701,8 @@ Exit:
     /* if incomplete but the overhead of the chunked encoding is >=100KB and >80%, signal an error */
     if (ret == -2) {
         decoder->_total_overhead += bufsz - dst;
-        if (decoder->_total_overhead >= 100 * 1024 && decoder->_total_read - decoder->_total_overhead < decoder->_total_read / 4)
+        if (decoder->_total_overhead >= 100 * 1024
+            && decoder->_total_read - decoder->_total_overhead < decoder->_total_read / 4)
             ret = -1;
     }
     return ret;
