@@ -35,8 +35,8 @@
 #include <sddf/util/util.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "picohttpparser.h"
 #include "utils.h"
@@ -78,7 +78,8 @@ static int request_next_hint = 0;
 #define HTTP_ERROR_AND_CLOSE(req, code, msg)                                   \
   do {                                                                         \
     if (req->connection && req->connection->pcb)                               \
-      send_http_error(req->connection->pcb, code, msg);                        \
+      send_http_error(req->connection->pcb, code, msg,                         \
+                     (req->version[0] ? req->version : "1.0"));                \
     request_close_connection(req);                                             \
   } while (0)
 
@@ -97,9 +98,14 @@ static uint64_t fs_buffer_bitmap[FS_BITMAP_WORDS];
 static int fs_buffer_next_hint = 0;
 
 static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
+static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err);
 static void http_error(void *arg, err_t err);
-static err_t http_poll(void *arg, struct tcp_pcb *pcb);
+static err_t http_poll_timeout(void *arg, struct tcp_pcb *pcb);
 static void request_start_operation(http_request_t *req);
+static void process_pipelined_requests(http_connection_t *conn);
+static void handle_stat_completion(http_request_t *req, fs_cmpl_t completion);
+static void handle_open_completion(http_request_t *req, fs_cmpl_t completion);
+static void handle_read_completion(http_request_t *req, fs_cmpl_t completion);
 
 static http_connection_t *connection_alloc(void);
 static void connection_free(http_connection_t *conn);
@@ -138,6 +144,41 @@ static void tcp_cleanup_callbacks(struct tcp_pcb *pcb)
     tcp_poll(pcb, NULL, 0);
 }
 
+static err_t http_poll_timeout(void *arg, struct tcp_pcb *pcb)
+{
+    http_connection_t *conn = (http_connection_t *)arg;
+
+    if (!conn || !conn->in_use) {
+        return ERR_OK;
+    }
+
+    if (!conn->current_request && conn->idle_since > 0) {
+        uint64_t current_time = sddf_timer_time_now(timer_config.driver_id);
+        uint64_t idle_duration_ns = current_time - conn->idle_since;
+        uint64_t idle_duration_ms = idle_duration_ns / 1000000ULL;
+        uint64_t timeout_ns = KEEPALIVE_TIMEOUT_MS * 1000000ULL;
+
+        sddf_dprintf("Poll check: pcb=%p (port %d->%d), idle=%lums/%dms, requests_served=%d\n",
+                     (void*)pcb, pcb->remote_port, pcb->local_port, idle_duration_ms, KEEPALIVE_TIMEOUT_MS, conn->requests_served);
+
+        if (idle_duration_ns >= timeout_ns) {
+            sddf_dprintf("Poll timeout: CLOSING idle connection pcb=%p (port %d->%d), idle=%lums >= %dms\n",
+                         (void*)pcb, pcb->remote_port, pcb->local_port, idle_duration_ms, KEEPALIVE_TIMEOUT_MS);
+            connection_free(conn);
+            return ERR_ABRT;
+        } else {
+            sddf_dprintf("Poll timeout: KEEPING connection pcb=%p (port %d->%d), idle=%lums < %dms\n",
+                         (void*)pcb, pcb->remote_port, pcb->local_port, idle_duration_ms, KEEPALIVE_TIMEOUT_MS);
+        }
+    } else if (conn->current_request) {
+        sddf_dprintf("Poll check: pcb=%p (port %d->%d) is ACTIVE (processing request), skipping timeout\n",
+                     (void*)pcb, pcb->remote_port, pcb->local_port);
+    }
+
+    return ERR_OK;
+}
+
+static bool allocate_request_buffers(http_request_t *req);
 static void free_request_buffers(http_request_t *req);
 
 static void send_file_read_command(http_request_t *req, uint64_t offset, size_t size)
@@ -160,13 +201,18 @@ static void finish_response_and_close(http_request_t *req)
 
     if (conn->keep_alive && conn->requests_served < KEEPALIVE_MAX_REQUESTS) {
         conn->requests_served++;
-        conn->last_activity_time = sddf_timer_time_now(timer_config.driver_id);
-        sddf_dprintf("Keep-alive: request complete on pcb=%p (port %d->%d), freeing request and waiting for next, requests_served=%d\n", 
-                   (void*)conn->pcb, conn->pcb->remote_port, conn->pcb->local_port, conn->requests_served);
-        
+        conn->idle_since = sddf_timer_time_now(timer_config.driver_id);
+        uint64_t idle_timestamp_ms = conn->idle_since / 1000000ULL;
+
+        sddf_dprintf("Keep-alive: request complete on pcb=%p (port %d->%d), NOW IDLE (timestamp=%lums), requests_served=%d\n",
+                   (void*)conn->pcb, conn->pcb->remote_port, conn->pcb->local_port, idle_timestamp_ms, conn->requests_served);
+
         request_free(req);
         conn->current_request = NULL;
-        conn->header_len = 0;
+
+        if (conn->has_pipelined_data) {
+            process_pipelined_requests(conn);
+        }
     } else {
         sddf_dprintf("Closing connection: keep_alive=%d, requests_served=%d\n", 
                    conn->keep_alive, conn->requests_served);
@@ -196,6 +242,20 @@ static void request_complete_operation(http_request_t *req)
         req->outstanding_operations--;
         req->fs_operation_in_flight = false;
     }
+}
+
+static bool allocate_request_buffers(http_request_t *req)
+{
+    req->path_buffer = fs_buffer_allocate();
+    req->read_buffer = fs_buffer_allocate();
+    req->stat_buffer = fs_buffer_allocate();
+    
+    if (req->path_buffer == -1 || req->read_buffer == -1 || req->stat_buffer == -1) {
+        free_request_buffers(req);
+        return false;
+    }
+    
+    return true;
 }
 
 static void free_request_buffers(http_request_t *req)
@@ -247,37 +307,51 @@ static const char *content_type_from_extension(const char *path)
 static http_connection_t *connection_alloc(void)
 {
     int idx = bitmap_alloc(connection_bitmap, MAX_CONCURRENT_REQUESTS, &connection_next_hint);
-    if (idx == -1)
+    if (idx == -1) {
         return NULL;
+    }
 
     memset(&connections[idx], 0, sizeof(http_connection_t));
     connections[idx].in_use = true;
     connections[idx].keep_alive = false;
     connections[idx].requests_served = 0;
-    connections[idx].last_activity_time = sddf_timer_time_now(timer_config.driver_id);
     connections[idx].current_request = NULL;
+    connections[idx].header_too_large = false;
+    connections[idx].has_pipelined_data = false;
+    connections[idx].idle_since = 0;
     return &connections[idx];
 }
 
 static void connection_free(http_connection_t *conn)
 {
-    if (!conn || !conn->in_use)
+    if (!conn || !conn->in_use) {
+        sddf_dprintf("connection_free: called on invalid/unused connection %p\n", (void*)conn);
         return;
+    }
+
+    int idx = conn - connections;
+    sddf_dprintf("connection_free: freeing connection #%d, pcb=%p, in_use=%d\n", 
+                 idx, (void*)conn->pcb, conn->in_use);
+
 
     if (conn->current_request) {
+        sddf_dprintf("connection_free: freeing current request for connection #%d\n", idx);
         request_free(conn->current_request);
         conn->current_request = NULL;
     }
 
     if (conn->pcb) {
+        sddf_dprintf("connection_free: closing TCP pcb=%p for connection #%d\n", 
+                     (void*)conn->pcb, idx);
         tcp_cleanup_callbacks(conn->pcb);
         tcp_close(conn->pcb);
         conn->pcb = NULL;
     }
 
-    int idx = conn - connections;
     bitmap_free(connection_bitmap, idx, MAX_CONCURRENT_REQUESTS, &connection_next_hint);
     conn->in_use = false;
+    
+    sddf_dprintf("connection_free: connection #%d freed, in_use now=%d\n", idx, conn->in_use);
 }
 
 static http_request_t *request_alloc(void)
@@ -335,8 +409,61 @@ static const char *get_cache_control(const char *content_type)
     return "max-age=31536000";
 }
 
+static int build_http_response(char *buffer, size_t buffer_size, int status_code, const char *status_text,
+                              const char *content_type, uint64_t content_length, const char *extra_headers,
+                              const char *body, bool keep_alive, const char *http_version)
+{
+    const char *connection = keep_alive ? "keep-alive" : "close";
+    int len = 0;
+
+    len = snprintf(buffer, buffer_size,
+                   "HTTP/%s %d %s\r\n"
+                   "Date: Mon, 01 Jan 2024 00:00:00 GMT\r\n"
+                   "Server: LionsOS/1.0\r\n",
+                   http_version, status_code, status_text);
+    
+    if (len < 0 || len >= buffer_size)
+        return -1;
+    
+    if (extra_headers) {
+        int extra_len = snprintf(buffer + len, buffer_size - len, "%s", extra_headers);
+        if (extra_len < 0 || len + extra_len >= buffer_size)
+            return -1;
+        len += extra_len;
+    }
+    
+    if (content_type) {
+        int ct_len = snprintf(buffer + len, buffer_size - len, "Content-Type: %s\r\n", content_type);
+        if (ct_len < 0 || len + ct_len >= buffer_size)
+            return -1;
+        len += ct_len;
+    }
+    
+    if (content_length > 0) {
+        int cl_len = snprintf(buffer + len, buffer_size - len, "Content-Length: %lu\r\n", content_length);
+        if (cl_len < 0 || len + cl_len >= buffer_size)
+            return -1;
+        len += cl_len;
+    }
+    
+    int conn_len = snprintf(buffer + len, buffer_size - len, "Connection: %s\r\n\r\n", connection);
+    if (conn_len < 0 || len + conn_len >= buffer_size)
+        return -1;
+    len += conn_len;
+    
+    if (body) {
+        size_t body_len = strlen(body);
+        if (len + body_len >= buffer_size)
+            return -1;
+        memcpy(buffer + len, body, body_len);
+        len += body_len;
+    }
+    
+    return len;
+}
+
 static int build_http_headers(char *buffer, size_t buffer_size, const char *content_type, uint64_t content_length,
-                              uint64_t mtime, bool keep_alive)
+                              uint64_t mtime, bool keep_alive, const char *http_version)
 {
     char last_modified_buffer[64];
     format_http_date_from_unix(last_modified_buffer, sizeof(last_modified_buffer), mtime);
@@ -347,7 +474,9 @@ static int build_http_headers(char *buffer, size_t buffer_size, const char *cont
     sddf_dprintf("Building HTTP headers with Connection: %s\n", connection);
 
     int len = snprintf(buffer, buffer_size,
-                       "HTTP/1.1 200 OK\r\n"
+                       "HTTP/%s 200 OK\r\n"
+                       "Date: Mon, 01 Jan 2024 00:00:00 GMT\r\n"
+                       "Server: LionsOS/1.0\r\n"
                        "Allow: GET, HEAD\r\n"
                        "Content-Type: %s\r\n"
                        "Content-Length: %lu\r\n"
@@ -355,7 +484,7 @@ static int build_http_headers(char *buffer, size_t buffer_size, const char *cont
                        "Cache-Control: %s\r\n"
                        "Connection: %s\r\n"
                        "\r\n",
-                       content_type, content_length, last_modified_buffer, cache_control, connection);
+                       http_version, content_type, content_length, last_modified_buffer, cache_control, connection);
 
     if (len < 0 || len >= buffer_size)
         return -1;
@@ -363,34 +492,31 @@ static int build_http_headers(char *buffer, size_t buffer_size, const char *cont
     return len;
 }
 
-static void send_http_error(struct tcp_pcb *pcb, int code, const char *status)
+static void send_http_error(struct tcp_pcb *pcb, int code, const char *status, const char *http_version)
 {
     static char response[256];
+    static char body[64];
+    const char *extra_headers = NULL;
     int len;
 
-    if (code == 405) {
-        len = snprintf(response, sizeof(response),
-                       "HTTP/1.1 405 Method Not Allowed\r\n"
-                       "Allow: GET, HEAD\r\n"
-                       "Content-Type: text/plain\r\n"
-                       "Content-Length: %d\r\n"
-                       "Connection: close\r\n"
-                       "\r\n"
-                       "405 Method Not Allowed\n",
-                       strlen("405 Method Not Allowed") + 1);
-    } else {
-        len = snprintf(response, sizeof(response),
-                       "HTTP/1.1 %d %s\r\n"
-                       "Content-Type: text/plain\r\n"
-                       "Content-Length: %d\r\n"
-                       "Connection: close\r\n"
-                       "\r\n"
-                       "%d %s\n",
-                       code, status, strlen(status) + 5, code, status);
+    if (!http_version || http_version[0] == '\0') {
+        http_version = "1.0";
     }
 
-    tcp_write(pcb, response, len, TCP_WRITE_FLAG_MORE);
-    tcp_output(pcb);
+    if (code == 405) {
+        extra_headers = "Allow: GET, HEAD\r\n";
+        strcpy(body, "405 Method Not Allowed\n");
+    } else {
+        snprintf(body, sizeof(body), "%d %s\n", code, status);
+    }
+
+    len = build_http_response(response, sizeof(response), code, status, "text/plain",
+                             strlen(body), extra_headers, body, false, http_version);
+
+    if (len > 0) {
+        tcp_write(pcb, response, len, TCP_WRITE_FLAG_COPY);
+        tcp_output(pcb);
+    }
 }
 
 static void parse_http_request(http_request_t *req)
@@ -412,6 +538,15 @@ static void parse_http_request(http_request_t *req)
         return;
     }
 
+    char *first_line_end = strstr(conn->header_buffer, "\r\n");
+    if (first_line_end) {
+        size_t request_line_len = first_line_end - conn->header_buffer;
+        if (request_line_len > 2048) {
+            HTTP_ERROR_AND_CLOSE(req, 414, "URI Too Long");
+            return;
+        }
+    }
+
     if (method_len >= sizeof(req->method)) {
         HTTP_ERROR_AND_CLOSE(req, 400, "Bad Request");
         return;
@@ -421,21 +556,16 @@ static void parse_http_request(http_request_t *req)
 
     bool is_get = (method_len == 3 && memcmp(method, "GET", 3) == 0);
     bool is_head = (method_len == 4 && memcmp(method, "HEAD", 4) == 0);
-    bool is_post = (method_len == 4 && memcmp(method, "POST", 4) == 0);
-
-    if (is_post) {
-        HTTP_ERROR_AND_CLOSE(req, 405, "Method Not Allowed");
-        return;
-    }
 
     if (!is_get && !is_head) {
-        HTTP_ERROR_AND_CLOSE(req, 501, "Not Implemented");
+        HTTP_ERROR_AND_CLOSE(req, 405, "Method Not Allowed");
         return;
     }
 
     req->is_head_request = is_head;
     req->if_modified_since = 0;
     conn->keep_alive = (minor_version >= 1);
+    bool has_host = false;
 
     sddf_dprintf("HTTP/%d.%d request parsing, default keep_alive=%d\n", 1, minor_version, conn->keep_alive);
 
@@ -454,7 +584,15 @@ static void parse_http_request(http_request_t *req)
                 conn->keep_alive = true;
                 sddf_dprintf("Connection: keep-alive header found, keep_alive=true\n");
             }
+        } else if (headers[i].name_len == 4 && strncasecmp(headers[i].name, "Host", 4) == 0) {
+            has_host = true;
         }
+    }
+
+    if (minor_version >= 1 && !has_host) {
+        snprintf(req->version, sizeof(req->version), "1.%d", minor_version);
+        HTTP_ERROR_AND_CLOSE(req, 400, "Bad Request");
+        return;
     }
 
     const char *query = memchr(path, '?', path_len);
@@ -480,16 +618,110 @@ static void parse_http_request(http_request_t *req)
 
     if (req->path[norm_result - 1] == '/') {
         if (norm_result + 10 >= sizeof(req->path)) {
-            send_http_error(req->connection->pcb, 414, "URI Too Long");
-            request_close_connection(req);
+            HTTP_ERROR_AND_CLOSE(req, 414, "URI Too Long");
             return;
         }
         strcat(req->path, "index.html");
     }
 
     snprintf(req->version, sizeof(req->version), "1.%d", minor_version);
-
     req->state = REQUEST_STATE_STAT_FILE;
+}
+
+static void handle_stat_completion(http_request_t *req, fs_cmpl_t completion)
+{
+    if (completion.status == FS_STATUS_SUCCESS) {
+        fs_stat_t *stat = (fs_stat_t *)(fs_share + req->stat_buffer);
+        req->file_size = stat->size;
+        req->file_mtime = stat->mtime;
+
+        if (req->if_modified_since > 0 && req->file_mtime <= req->if_modified_since && req->connection && req->connection->pcb) {
+            static char response[256];
+            const char *cache_control_header = "Cache-Control: max-age=3600\r\n";
+
+            int len = build_http_response(response, sizeof(response), 304, "Not Modified", NULL, 0,
+                                        cache_control_header, NULL, req->connection->keep_alive, req->version);
+
+            if (len > 0) {
+                tcp_write(req->connection->pcb, response, len, TCP_WRITE_FLAG_COPY);
+            }
+            finish_response_and_close(req);
+        } else if (FS_OP_SAFE(req)) {
+            request_start_operation(req);
+            fs_cmd_t cmd = { .type = FS_CMD_FILE_OPEN,
+                             .id = req->fs_request_id,
+                             .params.file_open = {
+                                 .path = { .offset = req->path_buffer, .size = strlen(req->full_path) },
+                                 .flags = FS_OPEN_FLAGS_READ_ONLY } };
+            SUBMIT_FS_CMD(cmd);
+            req->state = REQUEST_STATE_OPENING_FILE;
+        } else {
+            request_close_connection(req);
+        }
+    } else {
+        HTTP_ERROR_AND_CLOSE(req, 404, "Not Found");
+    }
+}
+
+static void handle_open_completion(http_request_t *req, fs_cmpl_t completion)
+{
+    if (completion.status == FS_STATUS_SUCCESS) {
+        req->file_fd = completion.data.file_open.fd;
+        req->file_open = true;
+
+        if (FS_OP_SAFE(req)) {
+            send_file_read_command(req, 0, MIN(FILE_READ_BUFFER_SIZE, req->file_size));
+            req->state = REQUEST_STATE_READING_FILE;
+        } else {
+            request_close_connection(req);
+        }
+    } else {
+        HTTP_ERROR_AND_CLOSE(req, 500, "Internal Server Error");
+    }
+}
+
+static void handle_read_completion(http_request_t *req, fs_cmpl_t completion)
+{
+    if (completion.status == FS_STATUS_SUCCESS) {
+
+        size_t bytes_read = completion.data.file_read.len_read;
+
+        if (!req->headers_sent && req->connection && req->connection->pcb) {
+            int header_len = build_http_headers(req->response_headers, sizeof(req->response_headers),
+                                                content_type_from_extension(req->path), req->file_size,
+                                                req->file_mtime, req->connection->keep_alive, req->version);
+
+            if (header_len > 0) {
+                tcp_write(req->connection->pcb, req->response_headers, header_len, TCP_WRITE_FLAG_MORE);
+                req->headers_sent = true;
+
+                if (req->is_head_request) {
+                    finish_response_and_close(req);
+                    return;
+                }
+            }
+        }
+
+        if (bytes_read > 0) {
+            if (!req->is_head_request && req->connection && req->connection->pcb) {
+                /* Use COPY flag for last chunk, MORE for intermediate chunks */
+                bool is_last_chunk = (req->file_offset + bytes_read >= req->file_size);
+                tcp_write(req->connection->pcb, fs_share + req->read_buffer, bytes_read, 
+                         is_last_chunk ? TCP_WRITE_FLAG_COPY : TCP_WRITE_FLAG_MORE);
+            }
+            req->file_offset += bytes_read;
+
+            if (req->file_offset < req->file_size && FS_OP_SAFE(req)) {
+                send_file_read_command(req, req->file_offset, FILE_READ_BUFFER_SIZE);
+            } else {
+                finish_response_and_close(req);
+            }
+        } else {
+            finish_response_and_close(req);
+        }
+    } else {
+        HTTP_ERROR_AND_CLOSE(req, 500, "Internal Server Error");
+    }
 }
 
 static void process_file_operations(void)
@@ -531,99 +763,17 @@ static void process_file_operations(void)
         }
 
         switch (req->state) {
-        case REQUEST_STATE_STAT_FILE: {
-            if (completion.status == FS_STATUS_SUCCESS) {
-                fs_stat_t *stat = (fs_stat_t *)(fs_share + req->stat_buffer);
-                req->file_size = stat->size;
-                req->file_mtime = stat->mtime;
-
-                if (req->if_modified_since > 0 && req->file_mtime <= req->if_modified_since && req->connection && req->connection->pcb) {
-                    static char response[256];
-                    const char *connection = req->connection->keep_alive ? "keep-alive" : "close";
-                    int len = snprintf(response, sizeof(response),
-                                       "HTTP/1.1 304 Not Modified\r\n"
-                                       "Cache-Control: max-age=3600\r\n"
-                                       "Connection: %s\r\n"
-                                       "\r\n",
-                                       connection);
-
-                    tcp_write(req->connection->pcb, response, len, TCP_WRITE_FLAG_MORE);
-                    finish_response_and_close(req);
-                } else if (FS_OP_SAFE(req)) {
-                    request_start_operation(req);
-                    fs_cmd_t cmd = { .type = FS_CMD_FILE_OPEN,
-                                     .id = req->fs_request_id,
-                                     .params.file_open = {
-                                         .path = { .offset = req->path_buffer, .size = strlen(req->full_path) },
-                                         .flags = FS_OPEN_FLAGS_READ_ONLY } };
-                    SUBMIT_FS_CMD(cmd);
-                    req->state = REQUEST_STATE_OPENING_FILE;
-                } else {
-                    request_close_connection(req);
-                }
-            } else {
-                HTTP_ERROR_AND_CLOSE(req, 404, "Not Found");
-            }
+        case REQUEST_STATE_STAT_FILE:
+            handle_stat_completion(req, completion);
             break;
-        }
 
-        case REQUEST_STATE_OPENING_FILE: {
-            if (completion.status == FS_STATUS_SUCCESS) {
-                req->file_fd = completion.data.file_open.fd;
-                req->file_open = true;
-
-                if (FS_OP_SAFE(req)) {
-                    send_file_read_command(req, 0, MIN(FILE_READ_BUFFER_SIZE, req->file_size));
-                    req->state = REQUEST_STATE_READING_FILE;
-                } else {
-                    request_close_connection(req);
-                }
-            } else {
-                HTTP_ERROR_AND_CLOSE(req, 500, "Internal Server Error");
-            }
+        case REQUEST_STATE_OPENING_FILE:
+            handle_open_completion(req, completion);
             break;
-        }
 
-        case REQUEST_STATE_READING_FILE: {
-            if (completion.status == FS_STATUS_SUCCESS) {
-
-                size_t bytes_read = completion.data.file_read.len_read;
-
-                if (!req->headers_sent && req->connection && req->connection->pcb) {
-                    int header_len = build_http_headers(req->response_headers, sizeof(req->response_headers),
-                                                        content_type_from_extension(req->path), req->file_size,
-                                                        req->file_mtime, req->connection->keep_alive);
-
-                    if (header_len > 0) {
-                        tcp_write(req->connection->pcb, req->response_headers, header_len, TCP_WRITE_FLAG_MORE);
-                        req->headers_sent = true;
-
-                        if (req->is_head_request) {
-                            finish_response_and_close(req);
-                            break;
-                        }
-                    }
-                }
-
-                if (bytes_read > 0) {
-                    if (!req->is_head_request && req->connection && req->connection->pcb) {
-                        tcp_write(req->connection->pcb, fs_share + req->read_buffer, bytes_read, TCP_WRITE_FLAG_MORE);
-                    }
-                    req->file_offset += bytes_read;
-
-                    if (req->file_offset < req->file_size && FS_OP_SAFE(req)) {
-                        send_file_read_command(req, req->file_offset, FILE_READ_BUFFER_SIZE);
-                    } else {
-                        finish_response_and_close(req);
-                    }
-                } else {
-                    finish_response_and_close(req);
-                }
-            } else {
-                HTTP_ERROR_AND_CLOSE(req, 500, "Internal Server Error");
-            }
+        case REQUEST_STATE_READING_FILE:
+            handle_read_completion(req, completion);
             break;
-        }
 
         default:
             request_close_connection(req);
@@ -632,17 +782,80 @@ static void process_file_operations(void)
     }
 
     fs_queue_publish_consumption(fs_completion_queue, to_consume);
+}
 
-    uint64_t current_time = sddf_timer_time_now(timer_config.driver_id);
+static void process_pipelined_requests(http_connection_t *conn)
+{
+    while (conn->in_use && conn->header_len > 0 && !conn->current_request) {
+        char *header_end = strstr(conn->header_buffer, "\r\n\r\n");
+        if (!header_end) {
+            /* No complete request yet */
+            break;
+        }
+        
+        sddf_dprintf("Processing pipelined request on pcb=%p (port %d->%d)\n", 
+                     (void*)conn->pcb, conn->pcb->remote_port, conn->pcb->local_port);
+        
+        http_request_t *req = request_alloc();
+        if (!req) {
+            connection_free(conn);
+            return;
+        }
+        
+        req->connection = conn;
+        conn->current_request = req;
+        conn->idle_since = 0;
+        req->state = REQUEST_STATE_PARSING;
+        req->fs_request_id = request_id_alloc();
 
-    for (int i = 0; i < MAX_CONCURRENT_REQUESTS; i++) {
-        if (connections[i].in_use && !connections[i].current_request) {
-            uint64_t timeout_ns = KEEPALIVE_TIMEOUT_MS * 1000000ULL;
-            if (current_time - connections[i].last_activity_time > timeout_ns) {
-                sddf_dprintf("Keep-alive timeout: closing idle connection after %llu ms\n", 
-                           (current_time - connections[i].last_activity_time) / 1000000ULL);
-                connection_free(&connections[i]);
+        sddf_dprintf("New request: pcb=%p (port %d->%d) NOW ACTIVE, idle_since cleared\n",
+                     (void*)conn->pcb, conn->pcb->remote_port, conn->pcb->local_port);
+
+
+        if (req->fs_request_id == 0) {
+            request_free(req);
+            conn->current_request = NULL;
+            connection_free(conn);
+            return;
+        }
+        
+        parse_http_request(req);
+        
+        /* Move remaining data to start of buffer */
+        size_t consumed = (header_end + 4) - conn->header_buffer;
+        size_t remaining = conn->header_len - consumed;
+        if (remaining > 0) {
+            memmove(conn->header_buffer, header_end + 4, remaining);
+            conn->has_pipelined_data = true;
+        } else {
+            conn->has_pipelined_data = false;
+        }
+        conn->header_len = remaining;
+        conn->header_buffer[conn->header_len] = '\0';
+        
+        /* Start processing the request */
+        if (req->state == REQUEST_STATE_STAT_FILE && FS_OP_SAFE(req)) {
+            if (!allocate_request_buffers(req)) {
+                connection_free(conn);
+                return;
             }
+            
+            snprintf(req->full_path, sizeof(req->full_path), "%s%s", WEB_ROOT_DIR, req->path);
+            size_t path_len = strlen(req->full_path);
+            memcpy(fs_share + req->path_buffer, req->full_path, path_len + 1);
+            
+            request_start_operation(req);
+            fs_cmd_t cmd = { .type = FS_CMD_STAT,
+                             .id = req->fs_request_id,
+                             .params.stat = {
+                                 .path = { .offset = req->path_buffer, .size = path_len },
+                                 .buf = { .offset = req->stat_buffer, .size = sizeof(fs_stat_t) } } };
+            SUBMIT_FS_CMD(cmd);
+            
+            break;
+        } else if (req->state == REQUEST_STATE_STAT_FILE) {
+            connection_free(conn);
+            return;
         }
     }
 }
@@ -671,70 +884,39 @@ static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
         return err;
     }
 
-    conn->last_activity_time = sddf_timer_time_now(timer_config.driver_id);
-    
     size_t copy_len = p->tot_len;
     if (conn->header_len + copy_len > sizeof(conn->header_buffer) - 1) {
         copy_len = sizeof(conn->header_buffer) - 1 - conn->header_len;
-    }
-
-    pbuf_copy_partial(p, conn->header_buffer + conn->header_len, copy_len, 0);
-    conn->header_len += copy_len;
-    conn->header_buffer[conn->header_len] = '\0';
-
-    if (strstr(conn->header_buffer, "\r\n\r\n")) {
-        sddf_dprintf("Complete HTTP request received on pcb=%p (port %d->%d), creating new request\n", 
-                     (void*)conn->pcb, conn->pcb->remote_port, conn->pcb->local_port);
-        
-        http_request_t *req = request_alloc();
-        if (!req) {
-            connection_free(conn);
-            tcp_recved(pcb, p->tot_len);
-            pbuf_free(p);
-            return ERR_OK;
-        }
-        
-        req->connection = conn;
-        conn->current_request = req;
-        req->state = REQUEST_STATE_PARSING;
-        req->fs_request_id = request_id_alloc();
-        
-        if (req->fs_request_id == 0) {
-            request_free(req);
-            conn->current_request = NULL;
-            connection_free(conn);
-            tcp_recved(pcb, p->tot_len);
-            pbuf_free(p);
-            return ERR_OK;
-        }
-        
-        parse_http_request(req);
-
-        if (req->state == REQUEST_STATE_STAT_FILE && FS_OP_SAFE(req)) {
-            req->path_buffer = fs_buffer_allocate();
-            req->read_buffer = fs_buffer_allocate();
-            req->stat_buffer = fs_buffer_allocate();
-
-            if (req->path_buffer == -1 || req->read_buffer == -1 || req->stat_buffer == -1) {
-                connection_free(conn);
-            } else {
-                snprintf(req->full_path, sizeof(req->full_path), "%s%s", WEB_ROOT_DIR, req->path);
-
-                size_t path_len = strlen(req->full_path);
-                memcpy(fs_share + req->path_buffer, req->full_path, path_len + 1);
-
-                request_start_operation(req);
-                fs_cmd_t cmd = { .type = FS_CMD_STAT,
-                                 .id = req->fs_request_id,
-                                 .params.stat = {
-                                     .path = { .offset = req->path_buffer, .size = path_len },
-                                     .buf = { .offset = req->stat_buffer, .size = sizeof(fs_stat_t) } } };
-                SUBMIT_FS_CMD(cmd);
-            }
-        } else if (req->state == REQUEST_STATE_STAT_FILE) {
-            connection_free(conn);
+        if (copy_len == 0) {
+            conn->header_too_large = true;
         }
     }
+
+    if (!conn->header_too_large) {
+        pbuf_copy_partial(p, conn->header_buffer + conn->header_len, copy_len, 0);
+        conn->header_len += copy_len;
+        conn->header_buffer[conn->header_len] = '\0';
+    }
+
+    if (conn->header_too_large ||
+        (conn->header_len >= sizeof(conn->header_buffer) - 1 && !strstr(conn->header_buffer, "\r\n\r\n"))) {
+        static char response[256];
+        static char body[] = "431 Request Header Fields Too Large\n";
+
+        int len = build_http_response(response, sizeof(response), 431, "Request Header Fields Too Large",
+                                    "text/plain", strlen(body), NULL, body, false, "1.0");
+
+        if (len > 0) {
+            tcp_write(pcb, response, len, TCP_WRITE_FLAG_COPY);
+            tcp_output(pcb);
+        }
+        connection_free(conn);
+        tcp_recved(pcb, p->tot_len);
+        pbuf_free(p);
+        return ERR_OK;
+    }
+
+    process_pipelined_requests(conn);
 
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
@@ -764,7 +946,7 @@ static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     tcp_arg(newpcb, conn);
     tcp_recv(newpcb, http_recv);
     tcp_err(newpcb, http_error);
-    tcp_poll(newpcb, http_poll, 0);
+    tcp_poll(newpcb, http_poll_timeout, 10);
 
     return ERR_OK;
 }
@@ -778,11 +960,6 @@ static void http_error(void *arg, err_t err)
     }
 }
 
-static err_t http_poll(void *arg, struct tcp_pcb *pcb)
-{
-    return ERR_OK;
-}
-
 static void setup_http_server(void)
 {
     struct tcp_pcb *pcb = tcp_new();
@@ -793,7 +970,7 @@ static void setup_http_server(void)
 
     err_t err = tcp_bind(pcb, IP_ADDR_ANY, 80);
     if (err != ERR_OK) {
-    // sddf_dprintf("Failed to bind TCP PCB: %d\n", err);
+        sddf_dprintf("Failed to bind TCP PCB: %d\n", err);
         tcp_close(pcb);
         return;
     }
@@ -806,6 +983,7 @@ static void setup_http_server(void)
 
     tcp_accept(pcb, http_accept);
     sddf_dprintf("HTTP server listening on port 80\n");
+    sddf_dprintf("HTTP server ready - listening on port 80 (sddf_printf test)\n");
 }
 
 static void netif_status_callback(char *ip_addr)
@@ -841,6 +1019,8 @@ void init(void)
     serial_queue_init(&serial_tx_queue_handle, serial_config.tx.queue.vaddr, serial_config.tx.data.size,
                       serial_config.tx.data.vaddr);
     serial_putchar_init(serial_config.tx.id, &serial_tx_queue_handle);
+    
+    sddf_dprintf("webserver_c: Starting initialization after serial init\n");
 
     net_enabled = net_config_check_magic(&net_config);
     if (net_enabled) {
@@ -857,7 +1037,7 @@ void notified(microkit_channel ch)
     if (net_enabled && ch == net_config.rx.id) {
         sddf_lwip_process_rx();
     } else if (net_enabled && ch == net_config.tx.id) {
-    /* handled by lib_sddf_lwip */
+        /* handled by lib_sddf_lwip */
     } else if (ch == timer_config.driver_id) {
         if (net_enabled) {
             sddf_lwip_process_timeout();

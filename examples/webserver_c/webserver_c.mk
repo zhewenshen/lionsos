@@ -1,10 +1,7 @@
-# Makefile for C webserver.
-#
 # Copyright 2025, UNSW
-#
 # SPDX-License-Identifier: BSD-2-Clause
-#
-#
+
+
 BOARD_DIR := $(MICROKIT_SDK)/board/$(MICROKIT_BOARD)/$(MICROKIT_CONFIG)
 ARCH := $(shell grep 'CONFIG_SEL4_ARCH  ' $(BOARD_DIR)/include/kernel/gen_config.h | cut -d' ' -f4)
 SDDF := $(LIONSOS)/dep/sddf
@@ -91,7 +88,6 @@ CFLAGS := \
 	-I$(LWIP)/include \
 	-I$(LWIP)/include/ipv4 \
 	-DWEB_ROOT_DIR=\"$(WEBSITE_DIR)\" \
-	-DCONFIG_DEBUG_BUILD
 
 LDFLAGS := -L$(BOARD_DIR)/lib
 LIBS := -lmicrokit -Tmicrokit.ld libsddf_util_debug.a
@@ -107,7 +103,6 @@ LIB_SDDF_LWIP_CFLAGS_webserver_c := \
 	-I$(SDDF)/network/ipstacks/lwip/src/include \
 	-Wno-tautological-constant-out-of-range-compare
 
-
 SDDF_MAKEFILES := ${SDDF}/util/util.mk \
 		  ${SDDF}/drivers/timer/${TIMER_DRIVER_DIR}/timer_driver.mk \
 		  ${SDDF}/drivers/network/${ETHERNET_DRIVER_DIR}/eth_driver.mk \
@@ -119,14 +114,11 @@ SDDF_MAKEFILES := ${SDDF}/util/util.mk \
 include ${SDDF_MAKEFILES}
 include $(NFS)/nfs.mk
 
-
-
 CHECK_FLAGS_BOARD_MD5:=.board_cflags-$(shell echo -- ${CFLAGS} ${BOARD} ${MICROKIT_CONFIG} | shasum | sed 's/ *-//')
 
 ${CHECK_FLAGS_BOARD_MD5}:
 	-rm -f .board_cflags-*
 	touch $@
-
 
 $(MUSL):
 	mkdir -p $@

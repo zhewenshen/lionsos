@@ -42,12 +42,14 @@ typedef struct http_connection {
     struct tcp_pcb *pcb;
     bool keep_alive;
     int requests_served;
-    uint64_t last_activity_time;
     bool in_use;
     struct http_request *current_request;
-    
-    char header_buffer[512];
+    uint64_t idle_since;
+
+    char header_buffer[2048];
     size_t header_len;
+    bool header_too_large;
+    bool has_pipelined_data;
 } http_connection_t;
 
 typedef struct http_request {
